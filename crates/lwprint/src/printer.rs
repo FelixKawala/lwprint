@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use bluer::rfcomm::{Security, SecurityLevel, Socket, SocketAddr, Stream};
 use bluer::Address;
 use lw_core::protocol;
-use lw_core::{Bitmap, JobOptions, Orientation, Status, StatusReader};
+use lw_core::{pad_to_page, strip, Bitmap, CutMode, JobOptions, Orientation, Status, StatusReader, LW_C410};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout, Instant};
@@ -68,6 +68,20 @@ fn page_chunks(label: &Bitmap, orientation: Orientation) -> Vec<Chunk> {
     chunks
 }
 
+/// The pages for printing `copies` of a label. With cutting after each label, every copy is
+/// its own page (the printer cuts at page ends). Otherwise all copies go onto one page with
+/// cut marks between them, so that only the strip, not every label, has to reach the
+/// printer's minimum page length. Returns the pages and how many copies each page holds.
+pub fn job_pages(label: &Bitmap, copies: usize, cut: CutMode, cut_marks: bool) -> (Vec<Bitmap>, usize) {
+    let copies = copies.max(1);
+    if cut == CutMode::Each || copies == 1 {
+        let page = pad_to_page(label, &LW_C410);
+        (vec![page; copies], 1)
+    } else {
+        (vec![pad_to_page(&strip(label, copies, cut_marks), &LW_C410)], copies)
+    }
+}
+
 /// The complete byte sequence of a job with one page per label, in sending order.
 /// All labels share one job, so the printer handles cutting between them itself.
 pub fn job_chunks(pages: &[Bitmap], opts: &JobOptions, orientation: Orientation) -> Vec<Chunk> {
@@ -116,10 +130,11 @@ impl Printer {
                 // or the kernel still paging a printer that was just switched on) makes new
                 // attempts fail with "already in progress" or "busy"; give it time.
                 let busy = last_err.as_ref().is_some_and(is_busy);
-                if attempt > 2 && !busy {
+                let transient = last_err.as_ref().is_some_and(is_transient);
+                if attempt > 2 && !busy && !transient {
                     break;
                 }
-                sleep(Duration::from_secs(if busy { 3 } else { 1 })).await;
+                sleep(Duration::from_secs(if busy { 3 } else { 2 })).await;
             }
             let lookup = match channel {
                 Some(_) => None,
@@ -342,15 +357,24 @@ impl Printer {
 }
 
 
+fn os_errors(e: &anyhow::Error) -> Vec<i32> {
+    e.chain().filter_map(|c| c.downcast_ref::<std::io::Error>()).filter_map(|io| io.raw_os_error()).collect()
+}
+
 /// True for errors meaning "someone else is connecting right now" (EBUSY, EALREADY, EINPROGRESS).
 fn is_busy(e: &anyhow::Error) -> bool {
-    e.chain()
-        .filter_map(|c| c.downcast_ref::<std::io::Error>())
-        .any(|io| matches!(io.raw_os_error(), Some(16) | Some(114) | Some(115)))
+    os_errors(e).iter().any(|c| matches!(c, 16 | 114 | 115))
         || e.chain().any(|c| {
             let s = c.to_string();
             s.contains("already in progress") || s.contains("Device or resource busy")
         })
+}
+
+/// True for errors that usually go away after a moment: the link was being torn down or the
+/// printer just woke up (ENOTCONN, ECONNRESET, ECONNABORTED, EHOSTDOWN, EHOSTUNREACH).
+fn is_transient(e: &anyhow::Error) -> bool {
+    os_errors(e).iter().any(|c| matches!(c, 103 | 104 | 107 | 112 | 113))
+        || e.chain().any(|c| c.to_string().contains("not connected"))
 }
 
 /// Human-readable description of a status that prevents printing.

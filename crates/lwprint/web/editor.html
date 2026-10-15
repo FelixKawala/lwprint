@@ -321,7 +321,10 @@ dialog::backdrop { background: rgba(15, 20, 18, 0.45); }
             <option value="end">Only after the last label (one strip)</option>
             <option value="none">Don't cut</option>
           </select>
-          <div class="hint">Copies print as one job, so the blank lead at the start is only needed once.</div>
+          <div class="hint">Copies print as one job, so the blank lead at the start is only needed once. The printer makes every cut label at least 20 mm long; without cutting, copies share one strip and short labels take less tape.</div>
+        </div>
+        <div class="field">
+          <label class="inline"><input type="checkbox" id="cut-marks" checked> Cut marks between labels on a strip</label>
         </div>
         <div class="field">
           <label class="inline"><input type="checkbox" id="rotate"> Turn label upside down</label>
@@ -450,6 +453,7 @@ dialog::backdrop { background: rgba(15, 20, 18, 0.45); }
       density: Number($("density").value),
       copies: Math.max(1, Math.min(50, Number($("copies").value) || 1)),
       cut: $("cut").value,
+      cut_marks: $("cut-marks").checked,
       rotate: $("rotate").checked,
     };
     const minLen = num($("min-length").value);
@@ -617,7 +621,7 @@ dialog::backdrop { background: rgba(15, 20, 18, 0.45); }
   }
 
   /* ---------- Saving the design in this browser ---------- */
-  const SETTINGS = ["border", "margin", "padding", "gap", "min-length", "tape-mm", "density", "copies", "cut", "rotate"];
+  const SETTINGS = ["border", "margin", "padding", "gap", "min-length", "tape-mm", "density", "copies", "cut", "cut-marks", "rotate"];
   function save() {
     const settings = {};
     for (const id of SETTINGS) settings[id] = $(id).type === "checkbox" ? $(id).checked : $(id).value;
@@ -680,7 +684,8 @@ dialog::backdrop { background: rgba(15, 20, 18, 0.45); }
       };
       img.src = previewUrl;
       note.className = "stage-note";
-      note.textContent = `${Math.round(lengthMm)} mm long on ${tapeMm} mm tape` +
+      const strip = req.copies > 1 && req.cut !== "each";
+      note.textContent = `${Math.round(lengthMm)} mm of ${tapeMm} mm tape` + (strip ? ` for ${req.copies} labels` : "") +
         (!req.tape_mm && !printerTape ? " (no tape detected, showing 12 mm)" : "");
       $("print").disabled = false;
     } catch (e) {

@@ -217,8 +217,43 @@ pub struct RenderContext<'a> {
     pub notes: Option<&'a std::cell::RefCell<Vec<String>>>,
 }
 
-/// Shortest label Epson's app prints (its `getMinTapeLength`: 1 cm).
-pub const MIN_LABEL_MM: f32 = 10.0;
+/// Shortest page the LW-C410 prints: shorter pages are padded by the printer (observed
+/// about 20 mm, with or without cutting; Epson's app itself only enforces 10 mm).
+/// Apply with [`pad_to_page`] to whatever is sent as one page.
+pub const MIN_PAGE_MM: f32 = 20.0;
+
+/// Centre a bitmap on a page of at least [`MIN_PAGE_MM`], like the printer would.
+pub fn pad_to_page(b: &Bitmap, model: &Model) -> Bitmap {
+    let min = model.mm_to_px(MIN_PAGE_MM);
+    if b.width() >= min {
+        return b.clone();
+    }
+    let mut out = Bitmap::new(min, b.height());
+    out.blit(b, ((min - b.width()) / 2) as isize, 0);
+    out
+}
+
+/// Put `n` copies of a label side by side on one page, with short cut marks at the top and
+/// bottom edge between them. Used when the tape is not cut between labels, so that only the
+/// whole strip (not every label) has to reach the printer's minimum page length.
+pub fn strip(label: &Bitmap, n: usize, cut_marks: bool) -> Bitmap {
+    let (w, h) = (label.width(), label.height());
+    let mut out = Bitmap::new(w * n.max(1), h);
+    for i in 0..n.max(1) {
+        out.blit(label, (i * w) as isize, 0);
+    }
+    if cut_marks {
+        let tick = (h / 6).max(3);
+        for i in 1..n {
+            for x in [i * w - 1, i * w] {
+                for y in (0..tick).chain(h - tick..h) {
+                    out.set(x, y, true);
+                }
+            }
+        }
+    }
+    out
+}
 
 /// Border line thickness in pixels.
 fn border_px(b: Border) -> usize {
@@ -252,8 +287,7 @@ pub fn render(spec: &LabelSpec, ctx: &RenderContext) -> Result<Bitmap, RenderErr
     let content: usize =
         parts.iter().map(|(p, _)| p.width()).sum::<usize>() + gap * parts.len().saturating_sub(1);
     let min_len = spec.min_length_mm.map(|mm| ctx.model.mm_to_px(mm)).unwrap_or(0);
-    // Epson's app never prints labels shorter than 10 mm; do the same, centring the content.
-    let total = (content + 2 * (margin + inner_x)).max(min_len).max(ctx.model.mm_to_px(MIN_LABEL_MM));
+    let total = (content + 2 * (margin + inner_x)).max(min_len);
     let mut out = Bitmap::new(total, height);
     let mut x = (total - content) / 2;
     for (p, valign) in &parts {
@@ -663,6 +697,17 @@ mod tests {
             spec.border = style;
             render(&spec, &ctx(&[])).unwrap();
         }
+    }
+
+    #[test]
+    fn strips_and_page_padding() {
+        let label = Bitmap::new(30, 72);
+        let s = strip(&label, 3, true);
+        assert_eq!(s.width(), 90);
+        assert!(s.get(30, 0) && s.get(29, 71) && !s.get(30, 36), "cut marks only at the edges");
+        let padded = pad_to_page(&label, &LW_C410);
+        assert_eq!(padded.width(), LW_C410.mm_to_px(MIN_PAGE_MM));
+        assert_eq!(pad_to_page(&s, &LW_C410).width(), LW_C410.mm_to_px(MIN_PAGE_MM).max(90));
     }
 
     #[test]

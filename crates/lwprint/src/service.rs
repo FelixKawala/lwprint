@@ -47,9 +47,16 @@ pub struct PrintRequest {
     /// Free-form ID echoed back in job results (useful with MQTT).
     #[serde(default)]
     pub request_id: Option<String>,
+    /// Short marks between labels when they are not cut apart (strip printing).
+    #[serde(default = "yes")]
+    pub cut_marks: bool,
     /// Name of the person or automation printing (shown in the job list; not verified).
     #[serde(default)]
     pub requested_by: Option<String>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// The `cut` field: a cut mode, or a plain boolean for compatibility.
@@ -298,7 +305,11 @@ impl Service {
             .tape_by_mm(mm)
             .ok_or_else(|| anyhow!("unsupported tape width {mm} mm (LW-C410: 4, 6, 9, 12, 18)"))?;
         let notes = std::cell::RefCell::new(Vec::new());
-        let bitmap = self.render_with(&req.label, tape, Some(&notes))?;
+        // Show what comes out of the printer: padded to the minimum page length, and all
+        // copies on one strip when they are not cut apart.
+        let label = self.render_with(&req.label, tape, Some(&notes))?;
+        let (pages, _) = crate::printer::job_pages(&label, req.copies as usize, req.cut.mode(), req.cut_marks);
+        let bitmap = pages.into_iter().next().unwrap_or(label);
         let mut notes = notes.into_inner();
         notes.dedup();
         Ok((bitmap, tape, notes))
@@ -624,15 +635,17 @@ impl Service {
             // All remaining copies go into one printer job, so the printer cuts between
             // them without feeding blank tape for every label.
             let base = done;
-            let pages: Vec<Bitmap> = (base..req.copies).map(|_| label.clone()).collect();
+            let remaining = req.copies - base;
+            let (pages, per_page) = crate::printer::job_pages(&label, remaining as usize, opts.cut, req.cut_marks);
+            let copies_after = move |n: usize| base + ((n * per_page) as u32).min(remaining);
             let stop = || self.is_cancelled(id);
             let mut on_sent = |n: usize| {
-                self.update_job(id, |j| j.copies_done = base + n as u32);
+                self.update_job(id, |j| j.copies_done = copies_after(n));
                 self.publish_status();
             };
             match p.print_pages(&pages, &opts, orientation, Duration::ZERO, &stop, &mut on_sent).await {
                 Ok(out) => {
-                    done = base + out.pages_sent as u32;
+                    done = copies_after(out.pages_sent);
                     warnings.extend(out.warning);
                     self.update_job(id, |j| j.copies_done = done);
                     if done < req.copies {
@@ -653,8 +666,9 @@ impl Service {
                     }
                     // The label being sent or printed when the error happened may be
                     // incomplete, so a retry prints it again.
-                    let sent = base + f.pages_sent as u32;
-                    self.update_job(id, |j| j.copies_done = sent.saturating_sub(1).max(base));
+                    let sent = copies_after(f.pages_sent);
+                    let safe = if per_page > 1 { base } else { sent.saturating_sub(1).max(base) };
+                    self.update_job(id, |j| j.copies_done = safe);
                     let msg = if req.copies > 1 {
                         format!("{f} ({sent} of {} labels were sent; check which ones printed)", req.copies)
                     } else {

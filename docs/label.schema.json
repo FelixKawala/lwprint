@@ -102,6 +102,11 @@
       "type": "string",
       "maxLength": 40,
       "description": "Service only. Name shown in the job history (not verified)."
+    },
+    "cut_marks": {
+      "type": "boolean",
+      "default": true,
+      "description": "Service only. Short marks between labels when copies share one strip (cut 'end' or 'none')."
     }
   },
   "$defs": {

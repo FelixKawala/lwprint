@@ -58,7 +58,13 @@ HTTP / MQTT ─► Service::submit ─► queue ─► worker ─► wait_for_pr
   just woke up sometimes drops the first connection.
 * **Waiting jobs retry every 5 s** and immediately when "Check now" is pressed (or the
   job is stopped), via a `Notify` in the service.
-* **Labels are at least 10 mm long**, like in Epson's app (`render::MIN_LABEL_MM`).
+* **Minimum page length 20 mm.** The LW-C410 pads every *page* shorter than about 20 mm
+  (observed with and without cutting; Epson's app only enforces 10 mm). lwprint pads
+  pages itself (`render::pad_to_page`, `MIN_PAGE_MM`) so previews match the tape. When
+  copies are not cut apart (`end`/`none`), they go onto **one page** as a strip with cut
+  marks (`render::strip`, `printer::job_pages`), so tiny labels don't each cost 20 mm.
+* **The CLI remembers the RFCOMM channel** (`~/.cache/lwprint/<address>.channel`) and
+  retries transient errors (ENOTCONN, ECONNRESET, EHOSTDOWN…) as well as busy ones.
 * **Render at print time for the inserted tape**, not at submit time. The tape can
   change while a job waits.
 * **Retry automatically only before any image data was sent** (`PrintFailure::started`).

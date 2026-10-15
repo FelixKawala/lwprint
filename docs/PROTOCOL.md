@@ -147,8 +147,11 @@ Codes `51`–`5B` mean the same as `01`–`0B`.
 `WR`, `RV`, `TR`, `CT`, `OP`, `EI` are not decoded yet (`EI` looks like extra error info).
 
 Label length: Epson's app never sends labels shorter than **10 mm**
-(`ObjectData.getMinTapeLength`, 1 cm) or longer than 1 m; lwprint enforces the same
-minimum. Copies printed as one job come out without the blank lead between labels
+(`ObjectData.getMinTapeLength`, 1 cm) or longer than 1 m. The LW-C410 itself pads every
+**page** shorter than about **20 mm** (verified roughly: 6, 15 and 20 mm labels all came
+out about 2 cm long, centred), whether or not it cuts between pages. Epson's spec sheets
+list a minimum print margin of 2 mm and a minimum lead waste of 12 mm (the head-to-cutter
+distance, paid by the first label of each job). Copies printed as one job come out without the blank lead between labels
 (verified); the first label of every job still gets the lead, i.e. the distance between
 print head and cutter.
 

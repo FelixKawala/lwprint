@@ -144,6 +144,9 @@ struct PrintArgs {
     /// Same as --cut none
     #[arg(long, hide = true)]
     no_cut: bool,
+    /// Without cutting between copies: leave out the cut marks between labels
+    #[arg(long)]
+    no_cut_marks: bool,
     /// Number of labels to print
     #[arg(long, default_value_t = 1)]
     copies: u32,
@@ -222,10 +225,47 @@ async fn open(cli: &Cli) -> Result<(Printer, Address, u8)> {
         .ok_or_else(|| anyhow!("no printer given; use --device or set LWPRINT_DEVICE"))?
         .parse()
         .context("invalid Bluetooth address")?;
-    let (p, channel, _) = Printer::open(addr, cli.channel, cli.verbose)
-        .await
-        .context("could not connect to the printer (is it switched on and in range?)")?;
+    // Remember the channel after a successful lookup: fewer connections, fewer chances for
+    // the link races described in docs/PROTOCOL.md.
+    let cached = if cli.channel.is_none() { read_cached_channel(&addr) } else { None };
+    let result = Printer::open(addr, cli.channel.or(cached), cli.verbose).await;
+    let (p, channel, _) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            if cached.is_some() {
+                forget_cached_channel(&addr);
+            }
+            return Err(e.context("could not connect to the printer (is it switched on and in range?)"));
+        }
+    };
+    if cli.channel.is_none() && cached != Some(channel) {
+        write_cached_channel(&addr, channel);
+    }
     Ok((p, addr, channel))
+}
+
+fn channel_cache_file(addr: &Address) -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("lwprint").join(format!("{}.channel", addr.to_string().replace(':', ""))))
+}
+
+fn read_cached_channel(addr: &Address) -> Option<u8> {
+    std::fs::read_to_string(channel_cache_file(addr)?).ok()?.trim().parse().ok()
+}
+
+fn write_cached_channel(addr: &Address, channel: u8) {
+    if let Some(f) = channel_cache_file(addr) {
+        let _ = std::fs::create_dir_all(f.parent().unwrap_or(Path::new(".")));
+        let _ = std::fs::write(f, channel.to_string());
+    }
+}
+
+fn forget_cached_channel(addr: &Address) {
+    if let Some(f) = channel_cache_file(addr) {
+        let _ = std::fs::remove_file(f);
+    }
 }
 
 async fn print(cli: &Cli, args: &PrintArgs) -> Result<()> {
@@ -273,18 +313,22 @@ async fn print(cli: &Cli, args: &PrintArgs) -> Result<()> {
         let label = render(&spec, &ctx)?;
         print_notes(&notes);
         if let Some(out) = &args.preview {
-            let img = image::GrayImage::from_raw(label.width() as u32, label.height() as u32, label.to_gray())
+            // Show what comes out of the printer: padded to the minimum page length, and
+            // all copies on one strip when they are not cut apart.
+            let (pages, _) = printer::job_pages(&label, args.copies.max(1) as usize, cut, !args.no_cut_marks);
+            let page = &pages[0];
+            let img = image::GrayImage::from_raw(page.width() as u32, page.height() as u32, page.to_gray())
                 .context("could not build preview image")?;
             img.save(out).with_context(|| format!("could not save {}", out.display()))?;
             println!(
-                "Saved {} ({} mm tape, label {:.0} mm long)",
+                "Saved {} ({} mm tape, {:.0} mm of tape)",
                 out.display(),
                 tape.mm,
-                length_mm(label.width())
+                length_mm(page.width())
             );
         }
         if let Some(out) = &args.dump {
-            let pages = vec![label.clone(); args.copies.max(1) as usize];
+            let (pages, _) = printer::job_pages(&label, args.copies.max(1) as usize, cut, !args.no_cut_marks);
             let bytes: Vec<u8> = printer::job_chunks(&pages, &opts, orientation)
                 .into_iter()
                 .flat_map(|c| c.data)
@@ -316,7 +360,7 @@ async fn print(cli: &Cli, args: &PrintArgs) -> Result<()> {
     let label = render(&spec, &ctx)?;
     let settle = std::time::Duration::from_millis(args.settle_ms);
     let copies = args.copies.max(1) as usize;
-    let pages = vec![label.clone(); copies];
+    let (pages, _) = printer::job_pages(&label, copies, cut, !args.no_cut_marks);
     let out = p
         .print_pages(&pages, &opts, orientation, settle, &|| false, &mut |n| {
             if copies > 1 {
@@ -501,6 +545,7 @@ async fn print_via_server(
     req["density"] = args.density.into();
     req["cut"] = serde_json::to_value(cut)?;
     req["rotate"] = args.rotate.into();
+    req["cut_marks"] = (!args.no_cut_marks).into();
     if let Some(mm) = args.tape {
         req["tape_mm"] = mm.into();
     }

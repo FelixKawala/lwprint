@@ -61,7 +61,7 @@ lwprint status
 lwprint print --text "Screws M4"
 lwprint print --text "Screws M4" --text "Box 12" --qr "https://example.com/box/12"
 lwprint print --qr "https://inventory.lan/box/12" --text "Box 12"
-lwprint print --text "Spice" --copies 5 --cut end    # five labels on one strip
+lwprint print --text "Spice" --copies 5 --cut end    # five labels on one strip, cut marks between
 lwprint print --barcode "BOX-0042" --text "Box 42"
 lwprint print --barcode 4006381333931 --barcode-type ean13
 lwprint print --icon screwdriver --text "Screws M4"
@@ -109,7 +109,7 @@ lwprint print --text "Test" --qr "hello" --tape 12 --preview label.png
 | `--font NAME\|FILE` | Font family or .ttf/.otf file (default: DejaVu Sans, then any sans-serif) |
 | `--text-size MM` | Line height in mm (default: lines share the tape height) |
 | `--density -5..5` | Darker or lighter print |
-| `--cut each\|end\|none` | Cut after each label (default), only after the last one, or never |
+| `--cut each\|end\|none` | Cut after each label (default), only after the last one, or never. Without cutting, copies share one strip (with cut marks; `--no-cut-marks` to omit) |
 | `--qr-equal` | Equal QR squares instead of filling the tape height |
 | `--copies N` | Print N labels (as one job: the blank lead is needed only once) |
 | `--margin MM` | Blank tape at both ends (default 2) |
