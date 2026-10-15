@@ -109,10 +109,17 @@ impl Printer {
     /// connection to a printer that just woke up (or whose link is being torn down) can
     /// drop immediately. Returns the printer, the channel and its status.
     pub async fn open(addr: Address, channel: Option<u8>, verbose: bool) -> Result<(Self, u8, Status)> {
-        let mut last_err = None;
-        for attempt in 1..=2 {
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 1..=4 {
             if attempt > 1 {
-                sleep(Duration::from_secs(1)).await;
+                // Another connection attempt to the printer (from this program, the service,
+                // or the kernel still paging a printer that was just switched on) makes new
+                // attempts fail with "already in progress" or "busy"; give it time.
+                let busy = last_err.as_ref().is_some_and(is_busy);
+                if attempt > 2 && !busy {
+                    break;
+                }
+                sleep(Duration::from_secs(if busy { 3 } else { 1 })).await;
             }
             let lookup = match channel {
                 Some(_) => None,
@@ -139,7 +146,14 @@ impl Printer {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("could not connect to the printer")))
+        let err = last_err.unwrap_or_else(|| anyhow::anyhow!("could not connect to the printer"));
+        if is_busy(&err) {
+            return Err(err.context(
+                "another connection to the printer is in progress (is `lwprint serve` running? \
+                 then print through it with --server or LWPRINT_SERVER)",
+            ));
+        }
+        Err(err)
     }
 
     fn log(&self, msg: &str) {
@@ -325,6 +339,18 @@ impl Printer {
             sleep(Duration::from_millis(100)).await;
         }
     }
+}
+
+
+/// True for errors meaning "someone else is connecting right now" (EBUSY, EALREADY, EINPROGRESS).
+fn is_busy(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+        .any(|io| matches!(io.raw_os_error(), Some(16) | Some(114) | Some(115)))
+        || e.chain().any(|c| {
+            let s = c.to_string();
+            s.contains("already in progress") || s.contains("Device or resource busy")
+        })
 }
 
 /// Human-readable description of a status that prevents printing.

@@ -81,6 +81,21 @@ same `mdi:` names Home Assistant uses, about 7,200 icons). Emoji in text are pri
 the monochrome Noto Emoji font (about 1,400 emoji). Both are built into the binary;
 their licenses are in `crates/lwprint/assets/`.
 
+**Print through the service.** When `lwprint serve` runs, it owns the printer; let the
+CLI send jobs to it instead of connecting directly (two programs competing for the
+printer fail with "Operation already in progress"):
+
+```bash
+export LWPRINT_SERVER=http://labelprinter.lan:8080
+lwprint status                        # printer status as the service sees it
+lwprint print --text "Box 12" --qr "https://inventory.lan/box/12"
+lwprint print --text "Box 13" --no-wait   # return once queued (for scripts)
+```
+
+The CLI waits for the job and exits with an error if it fails; Ctrl+C stops the job.
+Image files are embedded automatically. `--name` (or `LWPRINT_NAME`) sets the name in
+the job history; `LWPRINT_TOKEN` passes the access token.
+
 **Preview without a printer** (saves a PNG at real resolution, 1 pixel = 0.14 mm):
 
 ```bash

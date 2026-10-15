@@ -22,6 +22,7 @@ crates/lwprint        the binary (CLI + service)
   service.rs          print service: job queue, single worker, retries, stop/retry,
                       cached printer status, events
   http.rs             axum HTTP API + editor page
+  client.rs           minimal HTTP client: the CLI's --server mode
   mqtt.rs             MQTT client, Home Assistant discovery
   config.rs           /etc/lwprint.toml
   web/editor.html     the editor (plain HTML/CSS/JS, embedded in the binary)
@@ -48,6 +49,10 @@ HTTP / MQTT ─► Service::submit ─► queue ─► worker ─► wait_for_pr
 * **Connect per job, disconnect afterwards.** Lets other devices (the laptop CLI, the
   phone app) use the printer in between. Status checks while idle are infrequent
   (default 5 minutes) for the same reason.
+* **The CLI prints through the service when `LWPRINT_SERVER` is set** (`client.rs`, a
+  tiny dependency-free HTTP client), so only one program ever talks to the printer.
+  Direct connections retry with a pause on EBUSY/EALREADY ("another connection in
+  progress") and point to `--server` if it persists.
 * **Connections are verified.** `Printer::open` looks up the channel (holding the SDP
   link until connected), connects, requests the status and retries once; a printer that
   just woke up sometimes drops the first connection.

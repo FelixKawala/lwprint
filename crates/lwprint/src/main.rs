@@ -1,5 +1,6 @@
 //! `lwprint`: print labels on an Epson LabelWorks LW-C410 over Bluetooth.
 
+mod client;
 mod config;
 mod fonts;
 mod http;
@@ -29,6 +30,13 @@ struct Cli {
     /// Log every step with timestamps to stderr
     #[arg(long, short, global = true)]
     verbose: bool,
+    /// Print through a running `lwprint serve` (e.g. http://labelprinter.lan:8080) instead
+    /// of connecting to the printer directly
+    #[arg(long, env = "LWPRINT_SERVER", global = true)]
+    server: Option<String>,
+    /// Access token for the service, if it requires one
+    #[arg(long, env = "LWPRINT_TOKEN", global = true, hide_env_values = true)]
+    token: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -157,6 +165,12 @@ struct PrintArgs {
     /// Rotate the label by 180 degrees on the tape
     #[arg(long)]
     rotate: bool,
+    /// With --server: name shown in the service's job list
+    #[arg(long, env = "LWPRINT_NAME")]
+    name: Option<String>,
+    /// With --server: return as soon as the job is queued instead of waiting for it
+    #[arg(long)]
+    no_wait: bool,
 }
 
 #[tokio::main]
@@ -169,6 +183,7 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<()> {
     match &cli.cmd {
+        Cmd::Status if cli.server.is_some() => server_status(&cli).await,
         Cmd::Status => {
             let (mut p, addr, ch) = open(&cli).await?;
             let st = p.status().await?;
@@ -240,6 +255,10 @@ async fn print(cli: &Cli, args: &PrintArgs) -> Result<()> {
         (_, CutArg::Each) => lw_core::CutMode::Each,
     };
     let opts = JobOptions { density: args.density, cut };
+
+    if let (Some(url), None, None) = (&cli.server, &args.preview, &args.dump) {
+        return print_via_server(cli, url, args, spec, &base_dir, cut).await;
+    }
 
     if args.preview.is_some() || args.dump.is_some() {
         let tape = requested_tape.unwrap_or(LW_C410.tape_by_mm(12).unwrap());
@@ -419,6 +438,116 @@ async fn serve(config_path: &Path) -> Result<()> {
         _ = tokio::signal::ctrl_c() => {
             service::log("stopping");
             Ok(())
+        }
+    }
+}
+
+fn client(cli: &Cli, url: &str) -> Result<client::Client> {
+    client::Client::new(url, cli.token.clone())
+}
+
+async fn server_status(cli: &Cli) -> Result<()> {
+    let url = cli.server.as_deref().unwrap_or_default();
+    let (code, st) = client(cli, url)?.request("GET", "/api/status", None).await?;
+    if code != 200 {
+        return Err(client::error_of(code, &st));
+    }
+    let online = st["printer_online"].as_bool().unwrap_or(false);
+    println!("Service:  {url}");
+    println!("Printer:  {}", if online { "reachable" } else { "switched off or out of range" });
+    if let Some(mm) = st["tape_mm"].as_u64() {
+        println!("Tape:     {mm} mm");
+    }
+    println!("State:    {}", st["state"].as_str().unwrap_or("unknown"));
+    if let Some(p) = st["problem"].as_str() {
+        println!("Problem:  {p}");
+    }
+    println!("Waiting:  {}", st["queue"].as_u64().unwrap_or(0));
+    Ok(())
+}
+
+/// Replace image file paths with data: URLs, since the service never reads files.
+fn embed_images(spec: &mut LabelSpec, base_dir: &Path) -> Result<()> {
+    use base64::Engine;
+    for item in &mut spec.elements {
+        if let Element::Image { path, .. } = &mut item.element {
+            if path.starts_with("data:") {
+                continue;
+            }
+            let file = base_dir.join(&*path);
+            let bytes = std::fs::read(&file).with_context(|| format!("could not read {}", file.display()))?;
+            let mime = match file.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+                Some("png") => "image/png",
+                Some("jpg") | Some("jpeg") => "image/jpeg",
+                _ => "application/octet-stream",
+            };
+            *path = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes));
+        }
+    }
+    Ok(())
+}
+
+async fn print_via_server(
+    cli: &Cli,
+    url: &str,
+    args: &PrintArgs,
+    mut spec: LabelSpec,
+    base_dir: &Path,
+    cut: lw_core::CutMode,
+) -> Result<()> {
+    embed_images(&mut spec, base_dir)?;
+    let mut req = serde_json::to_value(&spec)?;
+    req["copies"] = args.copies.max(1).into();
+    req["density"] = args.density.into();
+    req["cut"] = serde_json::to_value(cut)?;
+    req["rotate"] = args.rotate.into();
+    if let Some(mm) = args.tape {
+        req["tape_mm"] = mm.into();
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "cli".into());
+    req["requested_by"] = args.name.clone().unwrap_or(user).into();
+
+    let c = client(cli, url)?;
+    let (code, job) = c.request("POST", "/api/print", Some(&req)).await?;
+    if code != 202 {
+        return Err(client::error_of(code, &job));
+    }
+    let id = job["id"].as_u64().ok_or_else(|| anyhow!("the service returned no job id"))?;
+    println!("Queued as job {id} on {url}");
+    if args.no_wait {
+        return Ok(());
+    }
+
+    // Follow the job; Ctrl+C asks the service to stop it.
+    let mut last = String::new();
+    let mut stop_requested = false;
+    loop {
+        let (code, job) = c.request("GET", &format!("/api/jobs/{id}"), None).await?;
+        if code != 200 {
+            return Err(client::error_of(code, &job));
+        }
+        let state = job["state"].as_str().unwrap_or("unknown").to_string();
+        let message = job["message"].as_str().unwrap_or("").to_string();
+        let line = if message.is_empty() { state.clone() } else { format!("{state}: {message}") };
+        if line != last {
+            match state.as_str() {
+                "done" => {
+                    println!("Printed: {message}");
+                    return Ok(());
+                }
+                "failed" => bail!("job {id} failed: {message}"),
+                "cancelled" => bail!("job {id} stopped: {message}"),
+                _ => eprintln!("{line}"),
+            }
+            last = line;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(800)) => {}
+            _ = tokio::signal::ctrl_c(), if !stop_requested => {
+                stop_requested = true;
+                eprintln!("stopping job {id}...");
+                let _ = c.request("POST", &format!("/api/jobs/{id}/cancel"), None).await;
+            }
         }
     }
 }
