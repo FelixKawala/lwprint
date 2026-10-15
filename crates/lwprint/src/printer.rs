@@ -94,7 +94,7 @@ impl Printer {
         let started = Instant::now();
         let socket = Socket::new().context("could not create a Bluetooth socket")?;
         socket.set_security(Security { level: SecurityLevel::Medium, key_size: 0 })?;
-        let stream = timeout(Duration::from_secs(15), socket.connect(SocketAddr { addr, channel }))
+        let stream = timeout(Duration::from_secs(8), socket.connect(SocketAddr { addr, channel }))
             .await
             .context("timed out connecting to the printer (is it switched on and in range?)")?
             .with_context(|| format!("could not connect to {addr} on channel {channel}"))?;
@@ -102,6 +102,44 @@ impl Printer {
         let p = Self { stream, reader: StatusReader::default(), verbose, started, idle_queue };
         p.log(&format!("connected to {addr} channel {channel} (idle send queue value {:?})", p.idle_queue));
         Ok(p)
+    }
+
+    /// Look up the channel if needed, connect, and check that the connection works by
+    /// requesting the status. Tries a second time after a short pause, because the first
+    /// connection to a printer that just woke up (or whose link is being torn down) can
+    /// drop immediately. Returns the printer, the channel and its status.
+    pub async fn open(addr: Address, channel: Option<u8>, verbose: bool) -> Result<(Self, u8, Status)> {
+        let mut last_err = None;
+        for attempt in 1..=2 {
+            if attempt > 1 {
+                sleep(Duration::from_secs(1)).await;
+            }
+            let lookup = match channel {
+                Some(_) => None,
+                None => match crate::sdp::find_serial_channel(addr).await {
+                    Ok(l) => Some(l),
+                    Err(e) => {
+                        last_err = Some(e.context("could not look up the printer's serial port channel"));
+                        continue;
+                    }
+                },
+            };
+            let ch = channel.or(lookup.as_ref().map(|l| l.channel)).unwrap_or(6);
+            match Self::connect(addr, ch, verbose).await {
+                Ok(mut p) => {
+                    drop(lookup);
+                    match p.status().await {
+                        Ok(st) => return Ok((p, ch, st)),
+                        Err(e) => {
+                            p.log(&format!("connection check failed: {e:#}"));
+                            last_err = Some(e);
+                        }
+                    }
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("could not connect to the printer")))
     }
 
     fn log(&self, msg: &str) {

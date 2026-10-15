@@ -22,6 +22,11 @@ tested on hardware.
 * **Encryption is required.** Set `BT_SECURITY` to *medium* before connecting.
   Unencrypted connections are reset by the printer; *high* fails with `EACCES` when the
   pairing used "Just Works" (no PIN), which is how the C410 pairs.
+* **Keep the SDP connection open until the serial connection is up.** Closing the last
+  connection to the printer makes the kernel start tearing down the Bluetooth link; an
+  RFCOMM connection opened right then "succeeds" and the first write fails with
+  `ENOTCONN` ("Transport endpoint is not connected"). `sdp::Lookup` holds the SDP socket,
+  and `Printer::open` verifies the connection with a status request and retries once.
 * **Only one connection at a time.** Connect per job and disconnect afterwards so other
   devices can print.
 * **Linux queues writes in the kernel.** `write()` returns long before the data is on
@@ -140,6 +145,12 @@ job running on weak batteries.
 Codes `51`–`5B` mean the same as `01`–`0B`.
 
 `WR`, `RV`, `TR`, `CT`, `OP`, `EI` are not decoded yet (`EI` looks like extra error info).
+
+Label length: Epson's app never sends labels shorter than **10 mm**
+(`ObjectData.getMinTapeLength`, 1 cm) or longer than 1 m; lwprint enforces the same
+minimum. Copies printed as one job come out without the blank lead between labels
+(verified); the first label of every job still gets the lead, i.e. the distance between
+print head and cutter.
 
 Timing observed on the LW-C410: about 1.6 s Bluetooth transfer for a 35 mm label and
 roughly 3–4 mm/s printing, so ~13 s per short label including feed and cut.

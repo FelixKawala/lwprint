@@ -4,7 +4,6 @@
 use crate::config::Config;
 use crate::fonts::decode_data_url;
 use crate::printer::{describe_problem, Printer};
-use crate::sdp;
 use ab_glyph::FontArc;
 use lw_core::IconFont;
 use anyhow::{anyhow, Context, Result};
@@ -20,7 +19,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::time::{sleep, sleep_until, Instant};
 
 const KEEP_JOBS: usize = 100;
-const RETRY_PAUSE: Duration = Duration::from_secs(15);
+const RETRY_PAUSE: Duration = Duration::from_secs(5);
 
 fn one() -> u32 {
     1
@@ -196,6 +195,8 @@ pub struct Service {
     next_id: Mutex<u64>,
     tx: mpsc::UnboundedSender<WorkerMsg>,
     events: broadcast::Sender<Event>,
+    /// Wakes a job that is waiting for the printer ("Check now", stop requests).
+    wake: tokio::sync::Notify,
 }
 
 /// Why waiting for the printer ended without a usable connection.
@@ -256,6 +257,7 @@ impl Service {
             next_id: Mutex::new(1),
             tx,
             events,
+            wake: tokio::sync::Notify::new(),
         });
         tokio::spawn(worker(svc.clone(), rx));
         Ok(svc)
@@ -282,6 +284,9 @@ impl Service {
     }
 
     pub fn request_refresh(&self) {
+        // A job waiting for the printer tries again right away; otherwise the worker
+        // checks the printer.
+        self.wake.notify_waiters();
         let _ = self.tx.send(WorkerMsg::Refresh);
     }
 
@@ -414,6 +419,7 @@ impl Service {
             j.info.clone()
         };
         log(format!("job {id}: stop requested"));
+        self.wake.notify_waiters();
         if info.state != JobState::Printing {
             self.finish_job(id, JobState::Cancelled, "nothing was printed".into());
             return self.job(id).ok_or_else(|| anyhow!("no such job"));
@@ -529,25 +535,16 @@ impl Service {
         self.publish_status();
     }
 
-    async fn connect(&self) -> Result<Printer> {
+    async fn connect(&self) -> Result<(Printer, Status)> {
         let cached = *self.channel.lock().unwrap();
-        let channel = match cached {
-            Some(c) => c,
-            None => {
-                let c = sdp::find_serial_channel(self.addr).await?;
-                *self.channel.lock().unwrap() = Some(c);
-                c
-            }
-        };
-        Printer::connect(self.addr, channel, false).await
+        let (p, channel, st) = Printer::open(self.addr, cached, false).await?;
+        *self.channel.lock().unwrap() = Some(channel);
+        Ok((p, st))
     }
 
     async fn refresh(&self) {
         match self.connect().await {
-            Ok(mut p) => match p.status().await {
-                Ok(s) => self.set_status(&s),
-                Err(e) => self.set_offline(&format!("{e:#}")),
-            },
+            Ok((_, s)) => self.set_status(&s),
             Err(_) => self.set_offline("printer is switched off or out of range"),
         }
     }
@@ -559,17 +556,14 @@ impl Service {
                 return Err(WaitEnd::Cancelled);
             }
             let reason = match self.connect().await {
-                Ok(mut p) => match p.status().await {
-                    Ok(s) => {
-                        self.set_status(&s);
-                        match LW_C410.tape_by_code(s.tape_code()) {
-                            Some(tape) if s.is_ready() => return Ok((p, tape)),
-                            None => "no tape inserted".to_string(),
-                            Some(_) => describe_problem(&s),
-                        }
+                Ok((p, s)) => {
+                    self.set_status(&s);
+                    match LW_C410.tape_by_code(s.tape_code()) {
+                        Some(tape) if s.is_ready() => return Ok((p, tape)),
+                        None => "no tape inserted".to_string(),
+                        Some(_) => describe_problem(&s),
                     }
-                    Err(e) => format!("{e:#}"),
-                },
+                }
                 Err(_) => {
                     self.set_offline("printer is switched off or out of range");
                     "printer is switched off or out of range".to_string()
@@ -579,13 +573,10 @@ impl Service {
                 return Err(WaitEnd::GaveUp(format!("gave up waiting for the printer: {reason}")));
             }
             self.set_job_state(id, JobState::Waiting, Some(format!("waiting: {reason}")));
-            // Sleep in small steps so that a stop request takes effect quickly.
-            let until = Instant::now() + RETRY_PAUSE;
-            while Instant::now() < until {
-                if self.is_cancelled(id) {
-                    return Err(WaitEnd::Cancelled);
-                }
-                sleep(Duration::from_millis(500)).await;
+            // Wait a little, or less if someone presses "Check now" or stops the job.
+            tokio::select! {
+                _ = sleep(RETRY_PAUSE) => {}
+                _ = self.wake.notified() => {}
             }
         }
     }

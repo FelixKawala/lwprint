@@ -217,6 +217,9 @@ pub struct RenderContext<'a> {
     pub notes: Option<&'a std::cell::RefCell<Vec<String>>>,
 }
 
+/// Shortest label Epson's app prints (its `getMinTapeLength`: 1 cm).
+pub const MIN_LABEL_MM: f32 = 10.0;
+
 /// Border line thickness in pixels.
 fn border_px(b: Border) -> usize {
     match b {
@@ -249,7 +252,8 @@ pub fn render(spec: &LabelSpec, ctx: &RenderContext) -> Result<Bitmap, RenderErr
     let content: usize =
         parts.iter().map(|(p, _)| p.width()).sum::<usize>() + gap * parts.len().saturating_sub(1);
     let min_len = spec.min_length_mm.map(|mm| ctx.model.mm_to_px(mm)).unwrap_or(0);
-    let total = (content + 2 * (margin + inner_x)).max(min_len);
+    // Epson's app never prints labels shorter than 10 mm; do the same, centring the content.
+    let total = (content + 2 * (margin + inner_x)).max(min_len).max(ctx.model.mm_to_px(MIN_LABEL_MM));
     let mut out = Bitmap::new(total, height);
     let mut x = (total - content) / 2;
     for (p, valign) in &parts {

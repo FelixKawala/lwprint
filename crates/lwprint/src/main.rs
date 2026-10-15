@@ -207,13 +207,10 @@ async fn open(cli: &Cli) -> Result<(Printer, Address, u8)> {
         .ok_or_else(|| anyhow!("no printer given; use --device or set LWPRINT_DEVICE"))?
         .parse()
         .context("invalid Bluetooth address")?;
-    let channel = match cli.channel {
-        Some(c) => c,
-        None => sdp::find_serial_channel(addr)
-            .await
-            .context("could not look up the printer's serial port channel (try --channel 6)")?,
-    };
-    Ok((Printer::connect(addr, channel, cli.verbose).await?, addr, channel))
+    let (p, channel, _) = Printer::open(addr, cli.channel, cli.verbose)
+        .await
+        .context("could not connect to the printer (is it switched on and in range?)")?;
+    Ok((p, addr, channel))
 }
 
 async fn print(cli: &Cli, args: &PrintArgs) -> Result<()> {

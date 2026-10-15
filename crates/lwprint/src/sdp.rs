@@ -97,10 +97,19 @@ pub fn serial_port_channel(records: &De) -> Option<u8> {
     None
 }
 
+/// Result of a lookup. Keep it alive until the serial connection is open: dropping the
+/// SDP link makes the kernel start tearing down the Bluetooth connection, and a serial
+/// connection opened right then can land on the dying link (it connects, then the first
+/// write fails with "Transport endpoint is not connected").
+pub struct Lookup {
+    pub channel: u8,
+    _link: SeqPacket,
+}
+
 /// Ask the device for its service records and return the Serial Port channel.
-pub async fn find_serial_channel(addr: Address) -> Result<u8> {
+pub async fn find_serial_channel(addr: Address) -> Result<Lookup> {
     let sa = SocketAddr::new(addr, AddressType::BrEdr, SDP_PSM);
-    let sock = timeout(Duration::from_secs(10), SeqPacket::connect(sa))
+    let sock = timeout(Duration::from_secs(8), SeqPacket::connect(sa))
         .await
         .context("timed out connecting for service lookup")?
         .context("could not connect for service lookup")?;
@@ -136,8 +145,9 @@ pub async fn find_serial_channel(addr: Address) -> Result<u8> {
         if continuation.first().copied().unwrap_or(0) == 0 {
             let mut i = 0;
             let records = parse(&data, &mut i)?;
-            return serial_port_channel(&records)
-                .ok_or_else(|| anyhow!("the device has no Serial Port service"));
+            let channel =
+                serial_port_channel(&records).ok_or_else(|| anyhow!("the device has no Serial Port service"))?;
+            return Ok(Lookup { channel, _link: sock });
         }
     }
     bail!("service list too long")

@@ -48,6 +48,12 @@ HTTP / MQTT ─► Service::submit ─► queue ─► worker ─► wait_for_pr
 * **Connect per job, disconnect afterwards.** Lets other devices (the laptop CLI, the
   phone app) use the printer in between. Status checks while idle are infrequent
   (default 5 minutes) for the same reason.
+* **Connections are verified.** `Printer::open` looks up the channel (holding the SDP
+  link until connected), connects, requests the status and retries once; a printer that
+  just woke up sometimes drops the first connection.
+* **Waiting jobs retry every 5 s** and immediately when "Check now" is pressed (or the
+  job is stopped), via a `Notify` in the service.
+* **Labels are at least 10 mm long**, like in Epson's app (`render::MIN_LABEL_MM`).
 * **Render at print time for the inserted tape**, not at submit time. The tape can
   change while a job waits.
 * **Retry automatically only before any image data was sent** (`PrintFailure::started`).
@@ -141,8 +147,7 @@ every send, the kernel queue drain time and every status report.
 
 ## Not yet confirmed on paper
 
-Density other than 0, cut modes `end` and `none`, `--rotate`, multiple copies in one
-job (and how much tape it saves), images,
+Density other than 0, cut modes `end` and `none`, `--rotate`, images,
 barcodes, icons and emoji, 4/6/9/18 mm tape, borders, the service end to end on the target VM, Home
 Assistant discovery against a real Home Assistant.
 
