@@ -87,6 +87,11 @@ pub enum Element {
         data: String,
         #[serde(default)]
         size_mm: Option<f32>,
+        /// Fill the available height with squares of slightly uneven size (mixing whole
+        /// pixel widths) instead of equal squares; larger on average, but scanners must
+        /// cope with the unevenness. The tape edge serves as the white border.
+        #[serde(default)]
+        fill: bool,
     },
     /// Icon from the icon font by name (Material Design Icons, e.g. "screwdriver" or
     /// "mdi:screwdriver"). Fills the height unless `size_mm` is given.
@@ -298,7 +303,13 @@ fn render_element(e: &Element, height: usize, ctx: &RenderContext) -> Result<Bit
             let ch = icons.get(name).ok_or_else(|| RenderError::UnknownIcon(name.clone()))?;
             Ok(render_icon(&icons.font, ch, px(size_mm).unwrap_or(height)))
         }
-        Element::Qr { data, size_mm } => {
+        Element::Qr { data, size_mm, fill: true } => {
+            let target = px(size_mm).unwrap_or(height);
+            // The tape edge is a white border only if nothing (border, padding) is between.
+            let edge_is_quiet = target >= ctx.tape.pixels;
+            render_qr_fill(data, target, !edge_is_quiet)
+        }
+        Element::Qr { data, size_mm, fill: false } => {
             let qr = render_qr(data, px(size_mm).unwrap_or(height))?;
             if let Some(notes) = ctx.notes {
                 let module = qr_module_px(data, px(size_mm).unwrap_or(height)).unwrap_or(0);
@@ -436,6 +447,47 @@ pub fn render_icon(font: &FontArc, ch: char, px: usize) -> Bitmap {
     out
 }
 
+/// Render a QR code that fills `height` exactly, with squares of uneven whole-pixel
+/// sizes. `quiet_v` keeps a one-square white border at top and bottom; horizontally
+/// there is always a one-square border.
+pub fn render_qr_fill(data: &str, height: usize, quiet_v: bool) -> Result<Bitmap, RenderError> {
+    use qrcode::{Color, EcLevel, QrCode};
+    let qv = if quiet_v { 1 } else { 0 };
+    // The smaller code (fewer squares) gives larger squares; medium correction on a tie.
+    let code = [EcLevel::M, EcLevel::L]
+        .iter()
+        .filter_map(|l| QrCode::with_error_correction_level(data.as_bytes(), *l).ok())
+        .min_by_key(|c| c.width())
+        .ok_or_else(|| RenderError::Qr("too much data for a QR code".into()))?;
+    let w = code.width();
+    let step = height as f32 / (w + 2 * qv) as f32;
+    if step < 2.0 {
+        return Err(RenderError::Qr(format!(
+            "too much data for {} pixels ({:.1} mm); use shorter data or wider tape",
+            height,
+            height as f32 * 25.4 / 180.0
+        )));
+    }
+    // Square i spans [edge(i), edge(i + 1)); edges are rounded to whole pixels.
+    let edge = |i: usize| (i as f32 * step).round() as usize;
+    let width = edge(w + 2);
+    let colors = code.to_colors();
+    let mut out = Bitmap::new(width, height);
+    for my in 0..w {
+        let (y0, y1) = (edge(my + qv), edge(my + qv + 1).min(height));
+        for mx in 0..w {
+            if colors[my * w + mx] == Color::Dark {
+                for y in y0..y1 {
+                    for x in edge(mx + 1)..edge(mx + 2) {
+                        out.set(x, y, true);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Size of one QR square in pixels when `data` is rendered into `height` pixels.
 pub fn qr_module_px(data: &str, height: usize) -> Option<usize> {
     use qrcode::{EcLevel, QrCode};
@@ -559,6 +611,16 @@ mod tests {
     }
 
     #[test]
+    fn qr_fill_uses_full_height() {
+        let b = render_qr_fill("https://inventory.lan/box/12", 72, false).unwrap();
+        assert_eq!(b.height(), 72);
+        // Dark pixels reach the first and the last row (finder patterns at the edges).
+        assert!((0..b.width()).any(|x| b.get(x, 0)));
+        assert!((0..b.width()).any(|x| b.get(x, 71)));
+        assert!(render_qr_fill(&"x".repeat(200), 72, false).is_err());
+    }
+
+    #[test]
     fn qr_fits_12mm() {
         let b = render_qr("https://example.com/box/42", 72).unwrap();
         assert!(b.height() <= 72);
@@ -569,7 +631,7 @@ mod tests {
     fn barcode_and_layout() {
         let spec = LabelSpec::new(vec![
             Element::Barcode { data: "BOX-42".into(), symbology: Symbology::Code128, module_px: 2, height_mm: None },
-            Element::Qr { data: "42".into(), size_mm: None },
+            Element::Qr { data: "42".into(), size_mm: None, fill: false },
         ]);
         let b = render(&spec, &ctx(&[])).unwrap();
         assert_eq!(b.height(), 72);
@@ -578,7 +640,7 @@ mod tests {
 
     #[test]
     fn border_and_padding() {
-        let mut spec = LabelSpec::new(vec![Element::Qr { data: "42".into(), size_mm: None }]);
+        let mut spec = LabelSpec::new(vec![Element::Qr { data: "42".into(), size_mm: None, fill: false }]);
         spec.border = Border::Line;
         spec.padding_mm = 1.0;
         let framed = render(&spec, &ctx(&[])).unwrap();

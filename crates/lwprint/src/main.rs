@@ -81,6 +81,9 @@ struct PrintArgs {
     /// QR code content
     #[arg(long)]
     qr: Option<String>,
+    /// Stretch the QR code to the full tape height (slightly uneven squares)
+    #[arg(long)]
+    qr_fill: bool,
     /// Icon name from Material Design Icons (see `lwprint icons <search>`); repeat for more
     #[arg(long)]
     icon: Vec<String>,
@@ -326,7 +329,7 @@ fn build_spec(args: &PrintArgs) -> Result<(LabelSpec, PathBuf)> {
             elements.push(Element::Icon { name: name.clone(), size_mm: None });
         }
         if let Some(data) = &args.qr {
-            elements.push(Element::Qr { data: data.clone(), size_mm: None });
+            elements.push(Element::Qr { data: data.clone(), size_mm: None, fill: args.qr_fill });
         }
         if !args.text.is_empty() {
             elements.push(Element::Text {

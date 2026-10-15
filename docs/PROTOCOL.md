@@ -62,6 +62,10 @@ Example: status request `1B 7B 05 51 00 00 51 7D`.
 | `54 <u16 LE>` | page margin; only `0` tested, meaning not fully understood | verified with 0 |
 | `2B 00` / `2B 01` | feed tape / feed and cut | from app, untested |
 
+The printer clips each line to the printable width from the table below (tested on
+12 mm tape: 76/80/84-pixel lines print no wider than 72) and centres that window on the
+tape.
+
 Raster line (not framed): `1B 2E 00 00 00 01 <n u16 LE>` followed by `ceil(n/8)` bytes,
 `n` = pixels across the tape, first pixel in the highest bit. Epson's converter prints a
 pixel when its grey value is below 140.

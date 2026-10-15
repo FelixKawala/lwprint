@@ -60,6 +60,7 @@ If the lookup fails, pass `--channel 6` or set `LWPRINT_CHANNEL=6`.
 lwprint status
 lwprint print --text "Screws M4"
 lwprint print --text "Screws M4" --text "Box 12" --qr "https://example.com/box/12"
+lwprint print --qr "https://inventory.lan/box/12" --qr-fill --text "Box 12"
 lwprint print --barcode "BOX-0042" --text "Box 42"
 lwprint print --barcode 4006381333931 --barcode-type ean13
 lwprint print --icon screwdriver --text "Screws M4"

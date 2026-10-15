@@ -396,7 +396,7 @@ dialog::backdrop { background: rgba(15, 20, 18, 0.45); }
     const defaults = {
       text: { text: "", align: "center", size: null },
       icon: { name: null, codepoint: null, size: null },
-      qr: { data: "", size: null },
+      qr: { data: "", size: null, fill: false },
       barcode: { data: "", symbology: "code128", height: null },
       image: { data: null, dither: false, height: null },
       space: { mm: 5 },
@@ -417,7 +417,8 @@ dialog::backdrop { background: rgba(15, 20, 18, 0.45); }
         return Object.assign({ type: "icon", name: e.name }, e.size ? { size_mm: e.size } : {}, extra);
       case "qr":
         if (!e.data.trim()) return null;
-        return Object.assign({ type: "qr", data: e.data.trim() }, e.size ? { size_mm: e.size } : {}, extra);
+        return Object.assign({ type: "qr", data: e.data.trim() }, e.size ? { size_mm: e.size } : {},
+          e.fill ? { fill: true } : {}, extra);
       case "barcode":
         if (!e.data.trim()) return null;
         return Object.assign({ type: "barcode", data: e.data.trim(), symbology: e.symbology, module_px: 2 },
@@ -514,7 +515,15 @@ dialog::backdrop { background: rgba(15, 20, 18, 0.45); }
       case "qr": {
         const inp = h("input", { type: "text", id: p + "data", value: e.data, placeholder: "https://…",
           oninput: (ev) => { e.data = ev.target.value; changed(); } });
-        return [field("Content", inp), h("div", { class: "grid2" }, field("Size (mm)", mmInput(p + "size", e.size, "Full height", set("size"))), valign)];
+        return [
+          field("Content", inp),
+          h("div", { class: "grid2" }, field("Size (mm)", mmInput(p + "size", e.size, "Full height", set("size"))), valign),
+          h("div", { class: "field" },
+            h("label", { class: "inline" },
+              h("input", { type: "checkbox", id: p + "fill", checked: e.fill, onchange: (ev) => set("fill")(ev.target.checked) }),
+              "Fill the tape height"),
+            h("div", { class: "hint", text: "Larger code with slightly uneven squares. Usually easier to scan on narrow tape." })),
+        ];
       }
       case "barcode": {
         const inp = h("input", { type: "text", id: p + "data", value: e.data,

@@ -160,6 +160,11 @@
               "type": "number",
               "exclusiveMinimum": 0,
               "description": "QR code size; as large as fits by default."
+            },
+            "fill": {
+              "type": "boolean",
+              "default": false,
+              "description": "Stretch to the full height with slightly uneven squares (larger, usually easier to scan on narrow tape)."
             }
           }
         },

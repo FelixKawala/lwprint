@@ -64,7 +64,12 @@ HTTP / MQTT ─► Service::submit ─► queue ─► worker ─► wait_for_pr
 * **Fonts are bundled** (icons, emoji) so the binary works on a bare Alpine install; the
   text font comes from the system (DejaVu Sans preferred).
 * **QR codes**: the error-correction level giving the larger squares wins; squares must
-  be at least 2 px; a note warns at 2 px (0.28 mm).
+  be at least 2 px; a note warns at 2 px (0.28 mm). The printer clips lines to the
+  printable width (72 px on 12 mm, tested with `tools/edge_test.py`) and centres it on
+  the tape, so the only way to a larger code is `fill`: squares of uneven whole-pixel
+  size filling the full height, with the tape edge as the white border. In a simulation
+  (blur, ink spread, camera resolution, dark surroundings; ZBar decoder) fill decoded as
+  well or better than equal squares; confirm with real phones before making it default.
 * **Editor without build tools**: one HTML file, no framework, no CDN (works offline on
   the LAN). The design is remembered in the browser's localStorage.
 
@@ -125,8 +130,8 @@ every send, the kernel queue drain time and every status report.
 * Job history is kept in memory (last 100 jobs) and lost on restart.
 * No text shaping: combined emoji (flags, skin tones, family sequences) and complex
   scripts don't render correctly. The emoji picker only lists single-glyph emoji.
-* QR codes on 12 mm tape are limited to about 10 mm; content over ~17 characters gets
-  0.28 mm squares, which some phones struggle with.
+* QR codes on 12 mm tape are limited to the 72 printable pixels (about 10 mm); with
+  equal squares, content over ~17 characters gets 0.28 mm squares. `fill` helps.
 * The `54` page margin command is always sent as 0; its meaning isn't fully understood.
 * `requested_by` is free text, not authentication. The optional HTTP token is the only
   access control.
