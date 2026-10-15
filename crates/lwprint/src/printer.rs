@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use bluer::rfcomm::{Security, SecurityLevel, Socket, SocketAddr, Stream};
 use bluer::Address;
 use lw_core::protocol;
-use lw_core::{pad_to_page, strip, Bitmap, CutMode, JobOptions, Orientation, Status, StatusReader, LW_C410};
+use lw_core::{pad_to_page, Bitmap, CutMode, JobOptions, Orientation, Status, StatusReader, LW_C410};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout, Instant};
@@ -26,8 +26,8 @@ pub struct PrintFailure {
     /// False if the error happened before any image data was sent; such a print can
     /// safely be tried again without risking a duplicate label.
     pub started: bool,
-    /// Labels completely sent to the printer before the error.
-    pub pages_sent: usize,
+    /// Indexes of the pages completely sent to the printer before the error.
+    pub sent: Vec<usize>,
     pub error: anyhow::Error,
 }
 
@@ -39,11 +39,12 @@ impl std::fmt::Display for PrintFailure {
 
 impl std::error::Error for PrintFailure {}
 
-/// Result of a job that ran to its end (possibly stopped early on request).
+/// Result of a job that ran to its end (possibly with pages skipped on request).
 #[derive(Debug)]
 pub struct PrintOutcome {
-    /// Labels sent and printed; fewer than requested if stopping was requested.
-    pub pages_sent: usize,
+    /// Indexes of the pages sent and printed.
+    #[allow(dead_code)]
+    pub sent: Vec<usize>,
     /// A problem reported by the printer that did not prevent printing (e.g. low voltage).
     pub warning: Option<String>,
 }
@@ -68,18 +69,58 @@ fn page_chunks(label: &Bitmap, orientation: Orientation) -> Vec<Chunk> {
     chunks
 }
 
-/// The pages for printing `copies` of a label. With cutting after each label, every copy is
-/// its own page (the printer cuts at page ends). Otherwise all copies go onto one page with
-/// cut marks between them, so that only the strip, not every label, has to reach the
-/// printer's minimum page length. Returns the pages and how many copies each page holds.
-pub fn job_pages(label: &Bitmap, copies: usize, cut: CutMode, cut_marks: bool) -> (Vec<Bitmap>, usize) {
-    let copies = copies.max(1);
-    if cut == CutMode::Each || copies == 1 {
-        let page = pad_to_page(label, &LW_C410);
-        (vec![page; copies], 1)
-    } else {
-        (vec![pad_to_page(&strip(label, copies, cut_marks), &LW_C410)], copies)
+/// One page of a job and the labels on it: (index into the label list, copies).
+pub struct Page {
+    pub bitmap: Bitmap,
+    pub owners: Vec<(usize, usize)>,
+}
+
+/// The pages for printing several labels (each with a number of copies) as one job. With
+/// cutting after each label, every copy is its own page (the printer cuts at page ends).
+/// Otherwise everything goes onto one page as a strip with cut marks between labels, so
+/// that only the strip, not every label, has to reach the printer's minimum page length.
+pub fn batch_pages(labels: &[(Bitmap, usize)], cut: CutMode, cut_marks: bool) -> Vec<Page> {
+    if cut == CutMode::Each || labels.iter().map(|(_, n)| *n).sum::<usize>() <= 1 {
+        let mut pages = Vec::new();
+        for (i, (label, copies)) in labels.iter().enumerate() {
+            let page = pad_to_page(label, &LW_C410);
+            for _ in 0..*copies {
+                pages.push(Page { bitmap: page.clone(), owners: vec![(i, 1)] });
+            }
+        }
+        return pages;
     }
+    // Strip: all copies of all labels side by side, cut marks between neighbours.
+    let height = labels.first().map(|(l, _)| l.height()).unwrap_or(0);
+    let parts: Vec<&Bitmap> = labels.iter().flat_map(|(l, n)| std::iter::repeat_n(l, *n)).collect();
+    let width: usize = parts.iter().map(|p| p.width()).sum();
+    let mut joined = Bitmap::new(width, height);
+    let mut x = 0;
+    let mut boundaries = Vec::new();
+    for p in &parts {
+        if x > 0 {
+            boundaries.push(x);
+        }
+        joined.blit(p, x as isize, 0);
+        x += p.width();
+    }
+    if cut_marks {
+        let tick = (height / 6).max(3);
+        for b in boundaries {
+            for xx in [b - 1, b] {
+                for y in (0..tick).chain(height - tick..height) {
+                    joined.set(xx, y, true);
+                }
+            }
+        }
+    }
+    let owners = labels.iter().enumerate().map(|(i, (_, n))| (i, *n)).collect();
+    vec![Page { bitmap: pad_to_page(&joined, &LW_C410), owners }]
+}
+
+/// Pages for `copies` of one label (see [`batch_pages`]).
+pub fn job_pages(label: &Bitmap, copies: usize, cut: CutMode, cut_marks: bool) -> Vec<Bitmap> {
+    batch_pages(&[(label.clone(), copies.max(1))], cut, cut_marks).into_iter().map(|p| p.bitmap).collect()
 }
 
 /// The complete byte sequence of a job with one page per label, in sending order.
@@ -220,24 +261,27 @@ impl Printer {
             .context("the printer did not answer the status request")
     }
 
-    /// Print labels as one job (one page each) and wait until the printer reports the
-    /// job finished. `should_stop` is checked between labels; when it returns true, no
-    /// further labels are sent and the job is ended normally, so labels already sent
-    /// still print. `on_page_sent` is called with the number of labels sent so far.
+    /// Print pages as one job and wait until the printer reports the job finished.
+    /// `wanted(i)` is checked right before page `i` is sent; pages that are no longer
+    /// wanted (their labels were stopped) are skipped, and the job still ends normally,
+    /// so pages already sent print. `on_page_sent(i)` is called after page `i` was sent.
     pub async fn print_pages(
         &mut self,
         pages: &[Bitmap],
         opts: &JobOptions,
         orientation: Orientation,
         settle: Duration,
-        should_stop: &(dyn Fn() -> bool + Send + Sync),
+        wanted: &(dyn Fn(usize) -> bool + Send + Sync),
         on_page_sent: &mut (dyn FnMut(usize) + Send),
     ) -> Result<PrintOutcome, PrintFailure> {
         let mut started = false;
-        let mut pages_sent = 0;
-        self.print_inner(pages, opts, orientation, settle, should_stop, on_page_sent, &mut started, &mut pages_sent)
-            .await
-            .map_err(|error| PrintFailure { started, pages_sent, error })
+        let mut sent = Vec::new();
+        if !(0..pages.len()).any(wanted) {
+            return Ok(PrintOutcome { sent, warning: None });
+        }
+        let result =
+            self.print_inner(pages, opts, orientation, settle, wanted, on_page_sent, &mut started, &mut sent).await;
+        result.map_err(|error| PrintFailure { started, sent, error })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -247,10 +291,10 @@ impl Printer {
         opts: &JobOptions,
         orientation: Orientation,
         settle: Duration,
-        should_stop: &(dyn Fn() -> bool + Send + Sync),
+        wanted: &(dyn Fn(usize) -> bool + Send + Sync),
         on_page_sent: &mut (dyn FnMut(usize) + Send),
         started: &mut bool,
-        pages_sent: &mut usize,
+        sent: &mut Vec<usize>,
     ) -> Result<PrintOutcome> {
         let st = self.status().await?;
         if !st.is_ready() {
@@ -265,9 +309,9 @@ impl Printer {
         }
         let mut total_mm = 0.0f32;
         for (i, page) in pages.iter().enumerate() {
-            if i > 0 && should_stop() {
-                self.log(&format!("stop requested; ending the job after {i} labels"));
-                break;
+            if !wanted(i) {
+                self.log(&format!("skipping page {} (stopped)", i + 1));
+                continue;
             }
             for chunk in page_chunks(page, orientation) {
                 if chunk.raster {
@@ -281,9 +325,9 @@ impl Printer {
             // Don't run far ahead of the printer, so that a stop request takes effect
             // after the labels already sent.
             self.wait_until_sent(Duration::from_secs(120)).await?;
-            *pages_sent = i + 1;
+            sent.push(i);
             total_mm += page.width() as f32 * 25.4 / 180.0;
-            on_page_sent(*pages_sent);
+            on_page_sent(i);
         }
         self.send(&protocol::job_end()).await?;
 
@@ -325,7 +369,7 @@ impl Printer {
                         );
                     }
                     if finished {
-                        return Ok(PrintOutcome { pages_sent: *pages_sent, warning });
+                        return Ok(PrintOutcome { sent: sent.clone(), warning });
                     }
                 }
             }
@@ -406,5 +450,23 @@ mod tests {
         assert_eq!(count(&protocol::job_end()), 2, "reset at the start of the job setup and one job end");
         assert_eq!(bytes.iter().filter(|&&b| b == 0x0C).count() >= 3, true);
         assert!(bytes.ends_with(&[0x0C, 0x1B, 0x7B, 0x03, 0x40, 0x40, 0x7D]));
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    #[test]
+    fn batches_pages() {
+        let a = Bitmap::new(100, 72);
+        let b = Bitmap::new(200, 72);
+        let each = batch_pages(&[(a.clone(), 2), (b.clone(), 1)], CutMode::Each, true);
+        assert_eq!(each.len(), 3);
+        assert_eq!(each[2].owners, vec![(1, 1)]);
+        let strip = batch_pages(&[(a, 2), (b, 1)], CutMode::End, true);
+        assert_eq!(strip.len(), 1);
+        assert_eq!(strip[0].bitmap.width(), 400);
+        assert_eq!(strip[0].owners, vec![(0, 2), (1, 1)]);
     }
 }

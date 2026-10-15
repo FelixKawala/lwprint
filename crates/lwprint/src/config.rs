@@ -29,6 +29,10 @@ pub struct PrinterConfig {
     /// How long a job waits for the printer (switched off, no tape, ...) before it fails.
     #[serde(default = "default_retry_minutes")]
     pub retry_minutes: u64,
+    /// How long to wait for more labels before printing, so that labels sent in quick
+    /// succession share one printer job (and its blank lead). 0 prints immediately.
+    #[serde(default = "default_batch_window")]
+    pub batch_window_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -66,6 +70,9 @@ fn default_status_interval() -> u64 {
 }
 fn default_retry_minutes() -> u64 {
     10
+}
+fn default_batch_window() -> u64 {
+    1000
 }
 fn default_listen() -> String {
     "0.0.0.0:8080".into()

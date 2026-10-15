@@ -81,6 +81,18 @@ same `mdi:` names Home Assistant uses, about 7,200 icons). Emoji in text are pri
 the monochrome Noto Emoji font (about 1,400 emoji). Both are built into the binary;
 their licenses are in `crates/lwprint/assets/`.
 
+**Several labels as one job.** Put a list of labels in a JSON file; they print as one
+printer job, so the blank lead is fed only once (and with `--cut end` they share one
+strip):
+
+```bash
+lwprint print --spec boxes.json          # boxes.json: [ {label}, {label}, ... ]
+```
+
+The service does this automatically too: labels sent within `batch_window_ms` (1 s by
+default) of each other, or queued while the printer was off, share one printer job if
+they use the same darkness, cut mode and orientation.
+
 **Print through the service.** When `lwprint serve` runs, it owns the printer; let the
 CLI send jobs to it instead of connecting directly (two programs competing for the
 printer fail with "Operation already in progress"):
@@ -183,7 +195,7 @@ Build a static binary that runs on Alpine with
 | `GET /api/status` | | printer status JSON |
 | `POST /api/status/refresh` | | checks the printer in the background |
 | `POST /api/preview` | label JSON | PNG (headers `x-label-length-mm`, `x-tape-mm`) |
-| `POST /api/print` | label JSON | job JSON (`202`) |
+| `POST /api/print` | label JSON, or a list of labels (printed as one job) | job JSON, or a list of jobs (`202`) |
 | `GET /api/jobs` | | recent jobs |
 | `GET /api/jobs/{id}` | | one job: `queued`, `waiting`, `printing`, `done`, `failed` or `cancelled` |
 | `POST /api/jobs/{id}/cancel` | | stop a job; a printing job stops after the current label |
@@ -217,7 +229,7 @@ state, problem, labels waiting, last print, and "Check printer" and "Cancel prin
 
 | Topic | Direction | Content |
 |---|---|---|
-| `lwprint/print` | to service | label JSON (publish **without** retain) |
+| `lwprint/print` | to service | label JSON or a list of labels (publish **without** retain) |
 | `lwprint/result` | from service | job result: `done`, `failed` or `rejected`, with `request_id` |
 | `lwprint/state` | from service | printer status (retained) |
 | `lwprint/availability` | from service | `online` / `offline` |

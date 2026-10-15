@@ -188,9 +188,8 @@ async fn run(cli: Cli) -> Result<()> {
     match &cli.cmd {
         Cmd::Status if cli.server.is_some() => server_status(&cli).await,
         Cmd::Status => {
-            let (mut p, addr, ch) = open(&cli).await?;
-            let st = p.status().await?;
-            println!("Printer:  {addr} (channel {ch})");
+            let (_p, addr, st) = open(&cli).await?;
+            println!("Printer:  {addr}");
             match LW_C410.tape_by_code(st.tape_code()) {
                 Some(t) => println!("Tape:     {} mm ({} pixels)", t.mm, t.pixels),
                 None => println!("Tape:     none or unknown (code {:02X})", st.tape_code()),
@@ -218,7 +217,7 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-async fn open(cli: &Cli) -> Result<(Printer, Address, u8)> {
+async fn open(cli: &Cli) -> Result<(Printer, Address, lw_core::Status)> {
     let addr: Address = cli
         .device
         .as_deref()
@@ -229,7 +228,7 @@ async fn open(cli: &Cli) -> Result<(Printer, Address, u8)> {
     // the link races described in docs/PROTOCOL.md.
     let cached = if cli.channel.is_none() { read_cached_channel(&addr) } else { None };
     let result = Printer::open(addr, cli.channel.or(cached), cli.verbose).await;
-    let (p, channel, _) = match result {
+    let (p, channel, st) = match result {
         Ok(v) => v,
         Err(e) => {
             if cached.is_some() {
@@ -241,7 +240,10 @@ async fn open(cli: &Cli) -> Result<(Printer, Address, u8)> {
     if cli.channel.is_none() && cached != Some(channel) {
         write_cached_channel(&addr, channel);
     }
-    Ok((p, addr, channel))
+    if cli.verbose {
+        eprintln!("using channel {channel}");
+    }
+    Ok((p, addr, st))
 }
 
 fn channel_cache_file(addr: &Address) -> Option<PathBuf> {
@@ -269,8 +271,9 @@ fn forget_cached_channel(addr: &Address) {
 }
 
 async fn print(cli: &Cli, args: &PrintArgs) -> Result<()> {
-    let (spec, base_dir) = build_spec(args)?;
-    let needs_font = spec.elements.iter().any(|e| matches!(e.element, Element::Text { .. }));
+    let (specs, base_dir) = build_spec(args)?;
+    let needs_font =
+        specs.iter().flat_map(|s| &s.elements).any(|e| matches!(e.element, Element::Text { .. }));
     let fonts = if needs_font { vec![load_font(args.font.as_deref())?, icons::emoji_font()] } else { vec![] };
     let icon_font = icons::icon_font();
     let notes = std::cell::RefCell::new(Vec::<String>::new());
@@ -295,13 +298,14 @@ async fn print(cli: &Cli, args: &PrintArgs) -> Result<()> {
         (_, CutArg::Each) => lw_core::CutMode::Each,
     };
     let opts = JobOptions { density: args.density, cut };
+    let copies = args.copies.max(1) as usize;
 
     if let (Some(url), None, None) = (&cli.server, &args.preview, &args.dump) {
-        return print_via_server(cli, url, args, spec, &base_dir, cut).await;
+        return print_via_server(cli, url, args, specs, &base_dir, cut).await;
     }
 
-    if args.preview.is_some() || args.dump.is_some() {
-        let tape = requested_tape.unwrap_or(LW_C410.tape_by_mm(12).unwrap());
+    // Render every label for a tape and lay them out as the printer job's pages.
+    let build = |tape: lw_core::Tape| -> Result<Vec<printer::Page>> {
         let ctx = RenderContext {
             model: LW_C410,
             tape,
@@ -310,37 +314,38 @@ async fn print(cli: &Cli, args: &PrintArgs) -> Result<()> {
             load_image: &load_image,
             notes: Some(&notes),
         };
-        let label = render(&spec, &ctx)?;
+        let labels = specs
+            .iter()
+            .map(|s| render(s, &ctx).map(|b| (b, copies)))
+            .collect::<Result<Vec<_>, _>>()?;
         print_notes(&notes);
+        Ok(printer::batch_pages(&labels, cut, !args.no_cut_marks))
+    };
+
+    if args.preview.is_some() || args.dump.is_some() {
+        let tape = requested_tape.unwrap_or(LW_C410.tape_by_mm(12).unwrap());
+        let pages = build(tape)?;
         if let Some(out) = &args.preview {
-            // Show what comes out of the printer: padded to the minimum page length, and
-            // all copies on one strip when they are not cut apart.
-            let (pages, _) = printer::job_pages(&label, args.copies.max(1) as usize, cut, !args.no_cut_marks);
-            let page = &pages[0];
+            // What comes out of the printer: padded to the minimum page length, and all
+            // labels on one strip when they are not cut apart.
+            let page = &pages[0].bitmap;
             let img = image::GrayImage::from_raw(page.width() as u32, page.height() as u32, page.to_gray())
                 .context("could not build preview image")?;
             img.save(out).with_context(|| format!("could not save {}", out.display()))?;
-            println!(
-                "Saved {} ({} mm tape, {:.0} mm of tape)",
-                out.display(),
-                tape.mm,
-                length_mm(page.width())
-            );
+            let more = if pages.len() > 1 { format!("; first of {} pages", pages.len()) } else { String::new() };
+            println!("Saved {} ({} mm tape, {:.0} mm of tape{more})", out.display(), tape.mm, length_mm(page.width()));
         }
         if let Some(out) = &args.dump {
-            let (pages, _) = printer::job_pages(&label, args.copies.max(1) as usize, cut, !args.no_cut_marks);
-            let bytes: Vec<u8> = printer::job_chunks(&pages, &opts, orientation)
-                .into_iter()
-                .flat_map(|c| c.data)
-                .collect();
+            let bitmaps: Vec<_> = pages.into_iter().map(|p| p.bitmap).collect();
+            let bytes: Vec<u8> =
+                printer::job_chunks(&bitmaps, &opts, orientation).into_iter().flat_map(|c| c.data).collect();
             std::fs::write(out, &bytes).with_context(|| format!("could not save {}", out.display()))?;
             println!("Saved print job ({} bytes, {} mm tape) to {}", bytes.len(), tape.mm, out.display());
         }
         return Ok(());
     }
 
-    let (mut p, _, _) = open(cli).await?;
-    let st = p.status().await?;
+    let (mut p, _, st) = open(cli).await?;
     let tape = LW_C410
         .tape_by_code(st.tape_code())
         .ok_or_else(|| anyhow!("no supported tape detected (code {:02X})", st.tape_code()))?;
@@ -349,33 +354,27 @@ async fn print(cli: &Cli, args: &PrintArgs) -> Result<()> {
             bail!("--tape {} mm given, but {} mm tape is inserted", req.mm, tape.mm);
         }
     }
-    let ctx = RenderContext {
-            model: LW_C410,
-            tape,
-            fonts: &fonts,
-            icons: Some(&icon_font),
-            load_image: &load_image,
-            notes: Some(&notes),
-        };
-    let label = render(&spec, &ctx)?;
+    let pages = build(tape)?;
+    let bitmaps: Vec<_> = pages.iter().map(|p| p.bitmap.clone()).collect();
+    let total = bitmaps.len();
     let settle = std::time::Duration::from_millis(args.settle_ms);
-    let copies = args.copies.max(1) as usize;
-    let (pages, _) = printer::job_pages(&label, copies, cut, !args.no_cut_marks);
     let out = p
-        .print_pages(&pages, &opts, orientation, settle, &|| false, &mut |n| {
-            if copies > 1 {
-                eprintln!("sent label {n} of {copies}");
+        .print_pages(&bitmaps, &opts, orientation, settle, &|_| true, &mut |i| {
+            if total > 1 {
+                eprintln!("sent page {} of {total}", i + 1);
             }
         })
         .await?;
     if let Some(warning) = out.warning {
         eprintln!("warning: {warning}");
     }
+    let labels = specs.len() * copies;
+    let mm: f32 = bitmaps.iter().map(|b| length_mm(b.width())).sum();
     println!(
-        "Printed {} ({} mm tape, {:.0} mm long each)",
-        if copies == 1 { "1 label".to_string() } else { format!("{copies} labels") },
+        "Printed {} on {} mm tape ({:.0} mm of tape)",
+        if labels == 1 { "1 label".to_string() } else { format!("{labels} labels") },
         tape.mm,
-        length_mm(label.width())
+        mm
     );
     Ok(())
 }
@@ -392,8 +391,8 @@ fn length_mm(px: usize) -> f32 {
 
 /// Build the label from --spec or from the individual options.
 /// Returns the spec and the directory that relative image paths are resolved against.
-fn build_spec(args: &PrintArgs) -> Result<(LabelSpec, PathBuf)> {
-    let (mut spec, base) = if let Some(path) = &args.spec {
+fn build_spec(args: &PrintArgs) -> Result<(Vec<LabelSpec>, PathBuf)> {
+    let (mut specs, base) = if let Some(path) = &args.spec {
         let (json, base) = if path.as_os_str() == "-" {
             (std::io::read_to_string(std::io::stdin())?, PathBuf::from("."))
         } else {
@@ -402,7 +401,17 @@ fn build_spec(args: &PrintArgs) -> Result<(LabelSpec, PathBuf)> {
             let base = path.parent().map(Path::to_path_buf).unwrap_or_else(|| ".".into());
             (json, base)
         };
-        (serde_json::from_str::<LabelSpec>(&json).context("invalid label JSON")?, base)
+        // One label, or a list of labels that print together as one job.
+        let value: serde_json::Value = serde_json::from_str(&json).context("invalid label JSON")?;
+        let specs = if value.is_array() {
+            serde_json::from_value::<Vec<LabelSpec>>(value).context("invalid label JSON")?
+        } else {
+            vec![serde_json::from_value::<LabelSpec>(value).context("invalid label JSON")?]
+        };
+        if specs.is_empty() {
+            bail!("the label list is empty");
+        }
+        (specs, base)
     } else {
         let mut elements = Vec::new();
         if let Some(img) = &args.image {
@@ -436,30 +445,32 @@ fn build_spec(args: &PrintArgs) -> Result<(LabelSpec, PathBuf)> {
         if elements.is_empty() {
             bail!("nothing to print; use --text, --qr, --barcode, --image or --spec");
         }
-        (LabelSpec::new(elements), PathBuf::from("."))
+        (vec![LabelSpec::new(elements)], PathBuf::from("."))
     };
-    if let Some(m) = args.margin {
-        spec.margin_mm = m;
+    for spec in &mut specs {
+        if let Some(m) = args.margin {
+            spec.margin_mm = m;
+        }
+        if let Some(g) = args.gap {
+            spec.gap_mm = g;
+        }
+        if args.min_length.is_some() {
+            spec.min_length_mm = args.min_length;
+        }
+        if let Some(p) = args.padding {
+            spec.padding_mm = p;
+        }
+        if let Some(b) = args.border {
+            spec.border = match b {
+                BorderArg::None => lw_core::Border::None,
+                BorderArg::Line => lw_core::Border::Line,
+                BorderArg::Double => lw_core::Border::Double,
+                BorderArg::Rounded => lw_core::Border::Rounded,
+                BorderArg::Dashed => lw_core::Border::Dashed,
+            };
+        }
     }
-    if let Some(g) = args.gap {
-        spec.gap_mm = g;
-    }
-    if args.min_length.is_some() {
-        spec.min_length_mm = args.min_length;
-    }
-    if let Some(p) = args.padding {
-        spec.padding_mm = p;
-    }
-    if let Some(b) = args.border {
-        spec.border = match b {
-            BorderArg::None => lw_core::Border::None,
-            BorderArg::Line => lw_core::Border::Line,
-            BorderArg::Double => lw_core::Border::Double,
-            BorderArg::Rounded => lw_core::Border::Rounded,
-            BorderArg::Dashed => lw_core::Border::Dashed,
-        };
-    }
-    Ok((spec, base))
+    Ok((specs, base))
 }
 
 async fn serve(config_path: &Path) -> Result<()> {
@@ -535,64 +546,93 @@ async fn print_via_server(
     cli: &Cli,
     url: &str,
     args: &PrintArgs,
-    mut spec: LabelSpec,
+    specs: Vec<LabelSpec>,
     base_dir: &Path,
     cut: lw_core::CutMode,
 ) -> Result<()> {
-    embed_images(&mut spec, base_dir)?;
-    let mut req = serde_json::to_value(&spec)?;
-    req["copies"] = args.copies.max(1).into();
-    req["density"] = args.density.into();
-    req["cut"] = serde_json::to_value(cut)?;
-    req["rotate"] = args.rotate.into();
-    req["cut_marks"] = (!args.no_cut_marks).into();
-    if let Some(mm) = args.tape {
-        req["tape_mm"] = mm.into();
-    }
     let user = std::env::var("USER").unwrap_or_else(|_| "cli".into());
-    req["requested_by"] = args.name.clone().unwrap_or(user).into();
+    let mut reqs = Vec::new();
+    for mut spec in specs {
+        embed_images(&mut spec, base_dir)?;
+        let mut req = serde_json::to_value(&spec)?;
+        req["copies"] = args.copies.max(1).into();
+        req["density"] = args.density.into();
+        req["cut"] = serde_json::to_value(cut)?;
+        req["rotate"] = args.rotate.into();
+        req["cut_marks"] = (!args.no_cut_marks).into();
+        if let Some(mm) = args.tape {
+            req["tape_mm"] = mm.into();
+        }
+        req["requested_by"] = args.name.clone().unwrap_or_else(|| user.clone()).into();
+        reqs.push(req);
+    }
+    let body = if reqs.len() == 1 { reqs.remove(0) } else { serde_json::Value::Array(reqs) };
 
     let c = client(cli, url)?;
-    let (code, job) = c.request("POST", "/api/print", Some(&req)).await?;
+    let (code, reply) = c.request("POST", "/api/print", Some(&body)).await?;
     if code != 202 {
-        return Err(client::error_of(code, &job));
+        return Err(client::error_of(code, &reply));
     }
-    let id = job["id"].as_u64().ok_or_else(|| anyhow!("the service returned no job id"))?;
-    println!("Queued as job {id} on {url}");
+    let jobs: Vec<serde_json::Value> = match reply {
+        serde_json::Value::Array(a) => a,
+        one => vec![one],
+    };
+    let ids: Vec<u64> = jobs.iter().filter_map(|j| j["id"].as_u64()).collect();
+    if ids.is_empty() {
+        bail!("the service returned no job id");
+    }
+    let list: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+    println!("Queued as job{} {} on {url}", if ids.len() > 1 { "s" } else { "" }, list.join(", "));
     if args.no_wait {
         return Ok(());
     }
 
-    // Follow the job; Ctrl+C asks the service to stop it.
-    let mut last = String::new();
+    // Follow the jobs until all have finished; Ctrl+C asks the service to stop them.
+    let mut last: std::collections::HashMap<u64, String> = Default::default();
+    let mut open: Vec<u64> = ids.clone();
+    let mut failures = Vec::new();
     let mut stop_requested = false;
-    loop {
-        let (code, job) = c.request("GET", &format!("/api/jobs/{id}"), None).await?;
-        if code != 200 {
-            return Err(client::error_of(code, &job));
-        }
-        let state = job["state"].as_str().unwrap_or("unknown").to_string();
-        let message = job["message"].as_str().unwrap_or("").to_string();
-        let line = if message.is_empty() { state.clone() } else { format!("{state}: {message}") };
-        if line != last {
-            match state.as_str() {
-                "done" => {
-                    println!("Printed: {message}");
-                    return Ok(());
-                }
-                "failed" => bail!("job {id} failed: {message}"),
-                "cancelled" => bail!("job {id} stopped: {message}"),
-                _ => eprintln!("{line}"),
+    while !open.is_empty() {
+        for id in open.clone() {
+            let (code, job) = c.request("GET", &format!("/api/jobs/{id}"), None).await?;
+            if code != 200 {
+                return Err(client::error_of(code, &job));
             }
-            last = line;
+            let state = job["state"].as_str().unwrap_or("unknown").to_string();
+            let message = job["message"].as_str().unwrap_or("").to_string();
+            let line = if message.is_empty() { state.clone() } else { format!("{state}: {message}") };
+            let prefix = if ids.len() > 1 { format!("job {id}: ") } else { String::new() };
+            if last.get(&id) != Some(&line) {
+                match state.as_str() {
+                    "done" => println!("{prefix}printed: {message}"),
+                    "failed" | "cancelled" => {
+                        eprintln!("{prefix}{line}");
+                        failures.push(format!("job {id} {state}: {message}"));
+                    }
+                    _ => eprintln!("{prefix}{line}"),
+                }
+                last.insert(id, line);
+            }
+            if matches!(state.as_str(), "done" | "failed" | "cancelled") {
+                open.retain(|x| *x != id);
+            }
+        }
+        if open.is_empty() {
+            break;
         }
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_millis(800)) => {}
             _ = tokio::signal::ctrl_c(), if !stop_requested => {
                 stop_requested = true;
-                eprintln!("stopping job {id}...");
-                let _ = c.request("POST", &format!("/api/jobs/{id}/cancel"), None).await;
+                eprintln!("stopping...");
+                for id in &open {
+                    let _ = c.request("POST", &format!("/api/jobs/{id}/cancel"), None).await;
+                }
             }
         }
+    }
+    match failures.len() {
+        0 => Ok(()),
+        _ => bail!("{}", failures.join("; ")),
     }
 }

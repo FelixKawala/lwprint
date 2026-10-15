@@ -85,7 +85,8 @@ pixel when its grey value is below 140.
    the C410 (model number 1300).
 6. `0C` end of page. For more labels (copies or several pages), repeat steps 4 to 6 for
    each label within the same job; the cut mode from step 3 decides where the printer
-   cuts (from app: this is how Epson's app prints copies).
+   cuts (from app: this is how Epson's app prints copies; verified: copies come out
+   without the blank lead between them). Different labels can share a job the same way.
 7. `40` end of job.
 8. Wait until the kernel has transmitted everything (see Transport).
 9. Poll `51 00 00` about every 0.7 s: `ST` is `02` while printing and `05` when finished.

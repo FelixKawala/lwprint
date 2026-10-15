@@ -20,6 +20,8 @@ use tokio::time::{sleep, sleep_until, Instant};
 
 const KEEP_JOBS: usize = 100;
 const RETRY_PAUSE: Duration = Duration::from_secs(5);
+/// Most labels (jobs) combined into one printer job.
+const MAX_BATCH: usize = 25;
 
 fn one() -> u32 {
     1
@@ -308,7 +310,7 @@ impl Service {
         // Show what comes out of the printer: padded to the minimum page length, and all
         // copies on one strip when they are not cut apart.
         let label = self.render_with(&req.label, tape, Some(&notes))?;
-        let (pages, _) = crate::printer::job_pages(&label, req.copies as usize, req.cut.mode(), req.cut_marks);
+        let pages = crate::printer::job_pages(&label, req.copies as usize, req.cut.mode(), req.cut_marks);
         let bitmap = pages.into_iter().next().unwrap_or(label);
         let mut notes = notes.into_inner();
         notes.dedup();
@@ -339,6 +341,18 @@ impl Service {
     /// Validate and queue a print request.
     pub fn submit(&self, req: PrintRequest, source: &str) -> Result<JobInfo> {
         self.enqueue(Arc::new(req), source, None)
+    }
+
+    /// Validate and queue several labels at once; they print as one printer job when
+    /// their settings allow it. Nothing is queued if any label is invalid.
+    pub fn submit_all(&self, reqs: Vec<PrintRequest>, source: &str) -> Result<Vec<JobInfo>> {
+        if reqs.is_empty() || reqs.len() > MAX_BATCH {
+            return Err(anyhow!("send between 1 and {MAX_BATCH} labels at once"));
+        }
+        for (i, r) in reqs.iter().enumerate() {
+            self.preview(r).with_context(|| format!("label {} cannot be rendered", i + 1))?;
+        }
+        reqs.into_iter().map(|r| self.submit(r, source)).collect()
     }
 
     fn enqueue(&self, req: Arc<PrintRequest>, source: &str, retry_of: Option<u64>) -> Result<JobInfo> {
@@ -561,9 +575,11 @@ impl Service {
     }
 
     /// Connect and wait until the printer is ready, retrying until the deadline.
-    async fn wait_for_printer(&self, id: u64, deadline: Instant) -> Result<(Printer, Tape), WaitEnd> {
+    /// Gives up early if all `ids` were stopped.
+    async fn wait_for_printer(&self, ids: &[u64], deadline: Instant) -> Result<(Printer, Tape), WaitEnd> {
+        let all_cancelled = || ids.iter().all(|id| self.is_cancelled(*id));
         loop {
-            if self.is_cancelled(id) {
+            if all_cancelled() {
                 return Err(WaitEnd::Cancelled);
             }
             let reason = match self.connect().await {
@@ -583,8 +599,10 @@ impl Service {
             if Instant::now() + RETRY_PAUSE > deadline {
                 return Err(WaitEnd::GaveUp(format!("gave up waiting for the printer: {reason}")));
             }
-            self.set_job_state(id, JobState::Waiting, Some(format!("waiting: {reason}")));
-            // Wait a little, or less if someone presses "Check now" or stops the job.
+            for id in ids.iter().filter(|id| !self.is_cancelled(**id)) {
+                self.set_job_state(*id, JobState::Waiting, Some(format!("waiting: {reason}")));
+            }
+            // Wait a little, or less if someone presses "Check now" or stops a job.
             tokio::select! {
                 _ = sleep(RETRY_PAUSE) => {}
                 _ = self.wake.notified() => {}
@@ -592,71 +610,148 @@ impl Service {
         }
     }
 
-    async fn process(&self, id: u64) {
-        let Some(req) = self.jobs.lock().unwrap().iter().find(|j| j.info.id == id).map(|j| j.request.clone())
-        else {
-            return;
-        };
-        if self.is_cancelled(id) {
-            return self.finish_job(id, JobState::Cancelled, "nothing was printed".into());
-        }
-        let deadline = Instant::now() + Duration::from_secs(self.config.printer.retry_minutes * 60);
-        let opts = JobOptions { density: req.density, cut: req.cut.mode() };
-        let orientation = if req.rotate { Orientation::Rotated } else { Orientation::Normal };
-        let mut done = 0u32;
-        let mut warnings: Vec<String> = Vec::new();
-        let mut last_tape = None;
-        let mut last_length = 0.0f32;
+    fn is_queued(&self, id: u64) -> bool {
+        self.jobs.lock().unwrap().iter().any(|j| j.info.id == id && j.info.state == JobState::Queued)
+    }
 
-        'connect: while done < req.copies {
-            let (mut p, tape) = match self.wait_for_printer(id, deadline).await {
+    /// The job `first` plus all later queued jobs that can share a printer job with it
+    /// (same density, cut mode, cut marks and orientation), in queue order.
+    fn collect_batch(&self, first: u64) -> Vec<(u64, Arc<PrintRequest>)> {
+        let jobs = self.jobs.lock().unwrap();
+        let usable =
+            |j: &JobEntry| j.info.state == JobState::Queued && !j.cancel.load(Ordering::SeqCst);
+        let Some(head) = jobs.iter().find(|j| j.info.id == first && usable(j)) else {
+            return Vec::new();
+        };
+        let key = |r: &PrintRequest| (r.density, r.cut.mode(), r.cut_marks, r.rotate);
+        let head_key = key(&head.request);
+        jobs.iter()
+            .filter(|j| j.info.id >= first && usable(j) && key(&j.request) == head_key)
+            .take(MAX_BATCH)
+            .map(|j| (j.info.id, j.request.clone()))
+            .collect()
+    }
+
+    async fn process(&self, first: u64) {
+        if !self.is_queued(first) {
+            // Already printed as part of an earlier batch, or stopped.
+            return;
+        }
+        // Give a burst of jobs (e.g. from an automation) a moment to arrive, so that they
+        // share one printer job and the blank lead is fed only once.
+        let window = Duration::from_millis(self.config.printer.batch_window_ms);
+        if !window.is_zero() {
+            sleep(window).await;
+        }
+        let batch = self.collect_batch(first);
+        if batch.is_empty() {
+            if self.is_cancelled(first) {
+                self.finish_job(first, JobState::Cancelled, "nothing was printed".into());
+            }
+            return;
+        }
+        if batch.len() > 1 {
+            let ids: Vec<String> = batch.iter().map(|(id, _)| id.to_string()).collect();
+            log(format!("jobs {} share one printer job", ids.join(", ")));
+        }
+        self.run_batch(batch).await;
+    }
+
+    async fn run_batch(&self, batch: Vec<(u64, Arc<PrintRequest>)>) {
+        let deadline = Instant::now() + Duration::from_secs(self.config.printer.retry_minutes * 60);
+        let head = batch[0].1.clone();
+        let opts = JobOptions { density: head.density, cut: head.cut.mode() };
+        let orientation = if head.rotate { Orientation::Rotated } else { Orientation::Normal };
+        // Copies printed per batch member; a Mutex because the progress callback must be Send.
+        let done: Mutex<Vec<u32>> = Mutex::new(vec![0; batch.len()]);
+        let mut finished = vec![false; batch.len()];
+        let mut warnings: Vec<String> = Vec::new();
+        let mut lengths = vec![0.0f32; batch.len()];
+        let mut tape_mm = 0u8;
+        let others = batch.len() - 1;
+
+        'connect: loop {
+            let active: Vec<usize> = (0..batch.len())
+                .filter(|&i| !finished[i] && !self.is_cancelled(batch[i].0) && done.lock().unwrap()[i] < batch[i].1.copies)
+                .collect();
+            if active.is_empty() {
+                break;
+            }
+            let ids: Vec<u64> = active.iter().map(|&i| batch[i].0).collect();
+            let (mut p, tape) = match self.wait_for_printer(&ids, deadline).await {
                 Ok(v) => v,
-                Err(WaitEnd::Cancelled) => break 'connect,
-                Err(WaitEnd::GaveUp(reason)) => return self.finish_job(id, JobState::Failed, self.with_progress(reason, done, &req)),
+                Err(WaitEnd::Cancelled) => break,
+                Err(WaitEnd::GaveUp(reason)) => {
+                    for &i in &active {
+                        let d = done.lock().unwrap()[i];
+                        self.finish_job(batch[i].0, JobState::Failed, self.with_progress(reason.clone(), d, &batch[i].1));
+                        finished[i] = true;
+                    }
+                    break;
+                }
             };
-            if let Some(mm) = req.tape_mm {
-                if mm != tape.mm {
+            tape_mm = tape.mm;
+
+            // Render every label for the inserted tape; jobs that can't print fail alone.
+            let mut members: Vec<usize> = Vec::new();
+            let mut labels: Vec<(Bitmap, usize)> = Vec::new();
+            for &i in &active {
+                let (id, req) = (batch[i].0, &batch[i].1);
+                if let Some(mm) = req.tape_mm.filter(|mm| *mm != tape.mm) {
                     let msg = format!("label is for {mm} mm tape, but {} mm tape is inserted", tape.mm);
-                    return self.finish_job(id, JobState::Failed, self.with_progress(msg, done, &req));
+                    self.finish_job(id, JobState::Failed, msg);
+                    finished[i] = true;
+                    continue;
+                }
+                match self.render(&req.label, tape) {
+                    Ok(label) => {
+                        lengths[i] = label.width() as f32 * 25.4 / LW_C410.dpi as f32;
+                        let remaining = (req.copies - done.lock().unwrap()[i]) as usize;
+                        members.push(i);
+                        labels.push((label, remaining));
+                    }
+                    Err(e) => {
+                        self.finish_job(id, JobState::Failed, format!("{e:#}"));
+                        finished[i] = true;
+                    }
                 }
             }
-            // Render for the tape that is actually inserted (it may change between retries).
-            let label = match self.render(&req.label, tape) {
-                Ok(l) => l,
-                Err(e) => return self.finish_job(id, JobState::Failed, format!("{e:#}")),
-            };
-            last_tape = Some(tape);
-            last_length = label.width() as f32 * 25.4 / LW_C410.dpi as f32;
-            self.set_job_state(id, JobState::Printing, None);
-
-            if self.is_cancelled(id) {
-                break 'connect;
+            if members.is_empty() {
+                break;
             }
-            // All remaining copies go into one printer job, so the printer cuts between
-            // them without feeding blank tape for every label.
-            let base = done;
-            let remaining = req.copies - base;
-            let (pages, per_page) = crate::printer::job_pages(&label, remaining as usize, opts.cut, req.cut_marks);
-            let copies_after = move |n: usize| base + ((n * per_page) as u32).min(remaining);
-            let stop = || self.is_cancelled(id);
-            let mut on_sent = |n: usize| {
-                self.update_job(id, |j| j.copies_done = copies_after(n));
+            let pages = crate::printer::batch_pages(&labels, opts.cut, head.cut_marks);
+            let bitmaps: Vec<Bitmap> = pages.iter().map(|pg| pg.bitmap.clone()).collect();
+            for &i in &members {
+                self.set_job_state(batch[i].0, JobState::Printing, None);
+            }
+
+            let wanted = |pi: usize| pages[pi].owners.iter().any(|(m, _)| !self.is_cancelled(batch[members[*m]].0));
+            let mut on_sent = |pi: usize| {
+                for (m, copies) in &pages[pi].owners {
+                    let i = members[*m];
+                    let now = {
+                        let mut d = done.lock().unwrap();
+                        d[i] += *copies as u32;
+                        d[i]
+                    };
+                    self.update_job(batch[i].0, |j| j.copies_done = now);
+                }
                 self.publish_status();
             };
-            match p.print_pages(&pages, &opts, orientation, Duration::ZERO, &stop, &mut on_sent).await {
+            match p.print_pages(&bitmaps, &opts, orientation, Duration::ZERO, &wanted, &mut on_sent).await {
                 Ok(out) => {
-                    done = copies_after(out.pages_sent);
                     warnings.extend(out.warning);
-                    self.update_job(id, |j| j.copies_done = done);
-                    if done < req.copies {
-                        // Fewer labels than requested only happens when stopping was requested.
-                        break 'connect;
+                    if let Ok(s) = p.status().await {
+                        self.set_status(&s);
                     }
+                    break 'connect;
                 }
                 Err(f) if !f.started && Instant::now() < deadline => {
                     // Nothing was printed, so trying again cannot produce a duplicate.
-                    log(format!("job {id}: not started ({f}); retrying"));
-                    self.set_job_state(id, JobState::Waiting, Some(format!("waiting: retrying after: {f}")));
+                    log(format!("printer job not started ({f}); retrying"));
+                    for &i in &members {
+                        self.set_job_state(batch[i].0, JobState::Waiting, Some(format!("waiting: retrying after: {f}")));
+                    }
                     sleep(Duration::from_secs(3)).await;
                     continue 'connect;
                 }
@@ -664,35 +759,62 @@ impl Service {
                     if let Ok(s) = p.status().await {
                         self.set_status(&s);
                     }
-                    // The label being sent or printed when the error happened may be
-                    // incomplete, so a retry prints it again.
-                    let sent = copies_after(f.pages_sent);
-                    let safe = if per_page > 1 { base } else { sent.saturating_sub(1).max(base) };
-                    self.update_job(id, |j| j.copies_done = safe);
-                    let msg = if req.copies > 1 {
-                        format!("{f} ({sent} of {} labels were sent; check which ones printed)", req.copies)
-                    } else {
-                        format!("{f}")
-                    };
-                    return self.finish_job(id, JobState::Failed, msg);
+                    // The page being sent or printed when the error happened may be
+                    // incomplete; its labels count as not printed, so a retry prints them.
+                    let last_owners: Vec<usize> = f
+                        .sent
+                        .last()
+                        .map(|pi| pages[*pi].owners.iter().map(|(m, _)| members[*m]).collect())
+                        .unwrap_or_default();
+                    for &i in &members {
+                        let mut d = done.lock().unwrap()[i];
+                        if last_owners.contains(&i) {
+                            let on_last = f.sent.last().map(|pi| {
+                                pages[*pi].owners.iter().find(|(m, _)| members[*m] == i).map(|(_, c)| *c).unwrap_or(0)
+                            });
+                            d = d.saturating_sub(on_last.unwrap_or(0) as u32);
+                        }
+                        self.update_job(batch[i].0, |j| j.copies_done = d);
+                        let req = &batch[i].1;
+                        let msg = if req.copies > 1 || others > 0 {
+                            format!("{f} (check which labels printed)")
+                        } else {
+                            format!("{f}")
+                        };
+                        self.finish_job(batch[i].0, JobState::Failed, msg);
+                        finished[i] = true;
+                    }
+                    return;
                 }
-            }
-            if let Ok(s) = p.status().await {
-                self.set_status(&s);
             }
         }
 
-        if done < req.copies {
-            let msg = if done == 0 { "nothing was printed".to_string() } else { format!("{done} of {} printed", req.copies) };
-            return self.finish_job(id, JobState::Cancelled, msg);
+        // Close every member that is still open: printed, or stopped part-way.
+        let done = done.into_inner().unwrap();
+        for (i, (id, req)) in batch.iter().enumerate() {
+            if finished[i] {
+                continue;
+            }
+            if done[i] >= req.copies {
+                let mut msg = format!("{} × {:.0} mm on {} mm tape", req.copies, lengths[i], tape_mm);
+                if others > 0 {
+                    msg.push_str(&format!(", together with {others} other label{}", if others == 1 { "" } else { "s" }));
+                }
+                let mut w = warnings.clone();
+                w.dedup();
+                if !w.is_empty() {
+                    msg.push_str(&format!(" (warning: {})", w.join("; ")));
+                }
+                self.finish_job(*id, JobState::Done, msg);
+            } else {
+                let msg = if done[i] == 0 {
+                    "nothing was printed".to_string()
+                } else {
+                    format!("{} of {} printed", done[i], req.copies)
+                };
+                self.finish_job(*id, JobState::Cancelled, msg);
+            }
         }
-        let tape_mm = last_tape.map(|t| t.mm).unwrap_or(0);
-        let mut msg = format!("{} × {:.0} mm on {} mm tape", req.copies, last_length, tape_mm);
-        warnings.dedup();
-        if !warnings.is_empty() {
-            msg.push_str(&format!(" (warning: {})", warnings.join("; ")));
-        }
-        self.finish_job(id, JobState::Done, msg);
     }
 
     fn with_progress(&self, msg: String, done: u32, req: &PrintRequest) -> String {

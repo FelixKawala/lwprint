@@ -137,12 +137,24 @@ fn source(addr: &SocketAddr) -> String {
     format!("web {ip}")
 }
 
+/// One label (JSON object) or several (JSON array; they print as one printer job).
 async fn print(State(svc): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketAddr>, body: Bytes) -> Response {
+    let src = source(&addr);
+    if body.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'[') {
+        let reqs: Vec<PrintRequest> = match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => return bad_request(format!("invalid label JSON: {e}")),
+        };
+        return match svc.submit_all(reqs, &src) {
+            Ok(jobs) => (StatusCode::ACCEPTED, Json(jobs)).into_response(),
+            Err(e) => bad_request(format!("{e:#}")),
+        };
+    }
     let req = match parse_request(&body) {
         Ok(r) => r,
         Err(resp) => return resp,
     };
-    match svc.submit(req, &source(&addr)) {
+    match svc.submit(req, &src) {
         Ok(job) => (StatusCode::ACCEPTED, Json(job)).into_response(),
         Err(e) => bad_request(format!("{e:#}")),
     }

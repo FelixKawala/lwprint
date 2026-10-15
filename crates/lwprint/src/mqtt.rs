@@ -92,6 +92,18 @@ fn state_payload(st: &Value) -> Vec<u8> {
 }
 
 async fn handle_print(svc: &Service, client: &AsyncClient, base: &str, payload: &[u8]) {
+    // A list of labels prints as one printer job.
+    if payload.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'[') {
+        let result = serde_json::from_slice::<Vec<PrintRequest>>(payload)
+            .map_err(|e| format!("invalid label JSON: {e}"))
+            .and_then(|reqs| svc.submit_all(reqs, "mqtt").map_err(|e| format!("{e:#}")));
+        if let Err(message) = result {
+            log(format!("MQTT: rejected print request: {message}"));
+            let payload = json!({ "state": "rejected", "request_id": null, "message": message });
+            let _ = client.publish(format!("{base}/result"), QoS::AtLeastOnce, false, payload.to_string()).await;
+        }
+        return;
+    }
     let result = serde_json::from_slice::<PrintRequest>(payload)
         .map_err(|e| (None, format!("invalid label JSON: {e}")))
         .and_then(|req| {

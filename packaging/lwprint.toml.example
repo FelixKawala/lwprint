@@ -6,6 +6,7 @@ address = "44:B7:D0:64:FC:0E"
 # font = "DejaVu Sans"         # font family or path to a .ttf/.otf file
 status_interval_secs = 300     # check the printer every 5 minutes while idle (0 = off)
 retry_minutes = 10             # how long a job waits for the printer before it fails
+batch_window_ms = 1000         # wait this long for more labels to print them as one job
 
 [http]
 listen = "0.0.0.0:8080"

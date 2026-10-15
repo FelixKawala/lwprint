@@ -69,6 +69,12 @@ HTTP / MQTT ─► Service::submit ─► queue ─► worker ─► wait_for_pr
   change while a job waits.
 * **Retry automatically only before any image data was sent** (`PrintFailure::started`).
   After that, a retry could print a duplicate, so it is left to the user (`retry`).
+* **Batching:** before printing, the worker waits `batch_window_ms` (default 1 s) and
+  takes every queued job with the same density, cut mode, cut marks and orientation into
+  one printer job (`Service::collect_batch`, `run_batch`; at most 25). Each label keeps
+  its own job record; pages carry owners (`printer::Page`), so stopping one label skips
+  its pages without affecting the others. Lists of labels (API, MQTT, `--spec`) are
+  validated as a whole and queued together.
 * **Copies (and pages) go into one printer job**, like Epson's app does: one job setup,
   a page per label, one job end. The printer's firmware then cuts between labels itself
   instead of feeding the blank lead for every label. Pages are sent one at a time and
@@ -158,15 +164,13 @@ every send, the kernel queue drain time and every status report.
 
 ## Not yet confirmed on paper
 
-Density other than 0, cut modes `end` and `none`, `--rotate`, images,
+Density other than 0, cut modes `end` and `none`, strips, batches of different labels,
+`--rotate`, images,
 barcodes, icons and emoji, 4/6/9/18 mm tape, borders, the service end to end on the target VM, Home
 Assistant discovery against a real Home Assistant.
 
 ## Ideas / roadmap
 
-* Batch printing of *different* labels: merge queued jobs with the same density and cut
-  mode into one printer job, so a series of labels (e.g. from an automation) shares one
-  blank lead. Depends on how much the one-job copies save in practice.
 * Free layout mode: absolutely positioned and scalable elements with a canvas editor,
   next to the list editor.
 * Public browser version: compile `lw-core` to WebAssembly and print via Web Serial
