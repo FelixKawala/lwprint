@@ -75,6 +75,9 @@ HTTP / MQTT ─► Service::submit ─► queue ─► worker ─► wait_for_pr
   its own job record; pages carry owners (`printer::Page`), so stopping one label skips
   its pages without affecting the others. Lists of labels (API, MQTT, `--spec`) are
   validated as a whole and queued together.
+* **Hold mode** (`Service::set_held`): while held, the worker leaves queued jobs alone;
+  releasing re-sends them to the worker, which batches them as above. A printer job
+  that already started is not affected. Holds live in memory like the job history.
 * **Copies (and pages) go into one printer job**, like Epson's app does: one job setup,
   a page per label, one job end. The printer's firmware then cuts between labels itself
   instead of feeding the blank lead for every label. Pages are sent one at a time and

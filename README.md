@@ -93,6 +93,18 @@ The service does this automatically too: labels sent within `batch_window_ms` (1
 default) of each other, or queued while the printer was off, share one printer job if
 they use the same darkness, cut mode and orientation.
 
+**Hold labels.** To collect labels and print them together later (one blank lead for
+all of them), hold the queue, add labels, then release it. In the editor: "Hold labels",
+then "Print held labels". From the command line or scripts:
+
+```bash
+lwprint queue hold        # new labels are collected instead of printed
+lwprint print --spec boxes.json
+lwprint print --text "One more"
+lwprint queue release     # everything prints, combined into as few printer jobs as possible
+lwprint queue clear       # or: discard what is waiting
+```
+
 **Print through the service.** When `lwprint serve` runs, it owns the printer; let the
 CLI send jobs to it instead of connecting directly (two programs competing for the
 printer fail with "Operation already in progress"):
@@ -201,6 +213,8 @@ Build a static binary that runs on Alpine with
 | `POST /api/jobs/{id}/cancel` | | stop a job; a printing job stops after the current label |
 | `POST /api/jobs/{id}/retry` | | print the missing copies of a failed/stopped job (all copies of a finished one) |
 | `POST /api/jobs/cancel` | | stop all jobs |
+| `POST /api/queue/hold` | | hold new labels instead of printing them |
+| `POST /api/queue/release` | | print all held labels |
 | `GET /api/icons?q=…` | | icon search results (`name`, `codepoint`) |
 | `GET /api/emoji?q=…` | | emoji search results (`emoji`, `name`, `group`) |
 
@@ -225,7 +239,8 @@ If `token` is set in `[http]`, send `Authorization: Bearer <token>` (or `?token=
 
 With an `[mqtt]` section, the service connects to your broker and Home Assistant
 discovers a "Label printer" device with these entities: printer reachable, tape width,
-state, problem, labels waiting, last print, and "Check printer" and "Cancel printing" buttons.
+state, problem, labels waiting, last print, "Check printer" and "Cancel printing" buttons,
+and a "Hold labels" switch.
 
 | Topic | Direction | Content |
 |---|---|---|
@@ -235,6 +250,7 @@ state, problem, labels waiting, last print, and "Check printer" and "Cancel prin
 | `lwprint/availability` | from service | `online` / `offline` |
 | `lwprint/refresh` | to service | anything: check the printer now |
 | `lwprint/cancel` | to service | `all`, a job id, or a `request_id`: stop printing |
+| `lwprint/hold` | to service | `on`: hold labels, `off`: print held labels |
 
 Print from an automation:
 

@@ -173,6 +173,8 @@ struct JobEntry {
 /// Printer status as published to clients.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct PrinterState {
+    /// True while labels are held (the queue is paused).
+    pub held: bool,
     pub printer_online: bool,
     pub tape_mm: Option<u8>,
     pub state: String,
@@ -206,6 +208,8 @@ pub struct Service {
     events: broadcast::Sender<Event>,
     /// Wakes a job that is waiting for the printer ("Check now", stop requests).
     wake: tokio::sync::Notify,
+    /// While set, queued labels are kept instead of printed ("Hold labels").
+    held: AtomicBool,
 }
 
 /// Why waiting for the printer ended without a usable connection.
@@ -267,6 +271,7 @@ impl Service {
             tx,
             events,
             wake: tokio::sync::Notify::new(),
+            held: AtomicBool::new(false),
         });
         tokio::spawn(worker(svc.clone(), rx));
         Ok(svc)
@@ -290,6 +295,36 @@ impl Service {
 
     pub fn job(&self, id: u64) -> Option<JobInfo> {
         self.jobs.lock().unwrap().iter().find(|j| j.info.id == id).map(|j| j.info.clone())
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.held.load(Ordering::SeqCst)
+    }
+
+    /// Hold labels (pause the queue) or release them. Releasing prints everything that was
+    /// collected, combined into as few printer jobs as the labels' settings allow.
+    pub fn set_held(&self, hold: bool) {
+        let was = self.held.swap(hold, Ordering::SeqCst);
+        if was == hold {
+            return;
+        }
+        if hold {
+            log("holding labels");
+        } else {
+            let queued: Vec<u64> = self
+                .jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|j| j.info.state == JobState::Queued)
+                .map(|j| j.info.id)
+                .collect();
+            log(format!("releasing {} held label job(s)", queued.len()));
+            for id in queued {
+                let _ = self.tx.send(WorkerMsg::Print(id));
+            }
+        }
+        self.publish_status();
     }
 
     pub fn request_refresh(&self) {
@@ -526,6 +561,7 @@ impl Service {
         let snapshot = {
             let mut st = self.status.lock().unwrap();
             st.queue = queue;
+            st.held = self.is_held();
             st.clone()
         };
         let _ = self.events.send(Event::Status(snapshot));
@@ -624,6 +660,7 @@ impl Service {
             return Vec::new();
         };
         let key = |r: &PrintRequest| (r.density, r.cut.mode(), r.cut_marks, r.rotate);
+        // Released holds can be large; MAX_BATCH keeps a single printer job manageable.
         let head_key = key(&head.request);
         jobs.iter()
             .filter(|j| j.info.id >= first && usable(j) && key(&j.request) == head_key)
@@ -633,8 +670,9 @@ impl Service {
     }
 
     async fn process(&self, first: u64) {
-        if !self.is_queued(first) {
-            // Already printed as part of an earlier batch, or stopped.
+        if !self.is_queued(first) || self.is_held() {
+            // Already printed as part of an earlier batch, stopped, or held: held labels
+            // stay queued and are sent to the worker again when they are released.
             return;
         }
         // Give a burst of jobs (e.g. from an automation) a moment to arrive, so that they
@@ -642,6 +680,9 @@ impl Service {
         let window = Duration::from_millis(self.config.printer.batch_window_ms);
         if !window.is_zero() {
             sleep(window).await;
+        }
+        if self.is_held() {
+            return;
         }
         let batch = self.collect_batch(first);
         if batch.is_empty() {

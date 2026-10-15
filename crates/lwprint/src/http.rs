@@ -10,6 +10,8 @@
 //! POST /api/jobs/{id}/cancel  stop a job (a printing job stops after the current label)
 //! POST /api/jobs/{id}/retry   print the missing copies again (or all, if it finished)
 //! POST /api/jobs/cancel       stop all jobs
+//! POST /api/queue/hold        hold new labels instead of printing them
+//! POST /api/queue/release     print all held labels
 //! GET  /api/icons?q=&limit=   search icons
 //! GET  /api/emoji?q=&limit=   search emoji
 //! GET  /assets/mdi.ttf        icon font (for showing icons in the browser)
@@ -42,6 +44,8 @@ pub async fn serve(svc: Shared) -> Result<()> {
         .route("/jobs/{id}/cancel", post(cancel))
         .route("/jobs/{id}/retry", post(retry))
         .route("/jobs/cancel", post(cancel_all))
+        .route("/queue/hold", post(hold))
+        .route("/queue/release", post(release))
         .route("/icons", get(search_icons))
         .route("/emoji", get(search_emoji))
         .layer(middleware::from_fn_with_state(svc.clone(), auth));
@@ -212,4 +216,14 @@ async fn retry(State(svc): State<Shared>, ConnectInfo(addr): ConnectInfo<SocketA
 
 async fn cancel_all(State(svc): State<Shared>) -> Response {
     Json(serde_json::json!({ "stopped": svc.cancel_all() })).into_response()
+}
+
+async fn hold(State(svc): State<Shared>) -> impl IntoResponse {
+    svc.set_held(true);
+    Json(svc.status())
+}
+
+async fn release(State(svc): State<Shared>) -> impl IntoResponse {
+    svc.set_held(false);
+    Json(svc.status())
 }

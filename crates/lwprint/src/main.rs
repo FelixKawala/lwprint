@@ -47,6 +47,11 @@ enum Cmd {
     Status,
     /// Print a label (or save a preview with --preview)
     Print(PrintArgs),
+    /// Hold, release or clear labels in a running service (needs --server)
+    Queue {
+        #[arg(value_enum)]
+        action: QueueAction,
+    },
     /// Search the bundled icons (Material Design Icons) or emoji
     Icons {
         /// Search words, e.g. "screw" or "light bulb"
@@ -63,6 +68,18 @@ enum Cmd {
         #[arg(long, default_value = "/etc/lwprint.toml")]
         config: PathBuf,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum QueueAction {
+    /// Keep new labels instead of printing them
+    Hold,
+    /// Print all held labels (combined into as few printer jobs as possible)
+    Release,
+    /// Stop all held and waiting labels
+    Clear,
+    /// Show the queue
+    Show,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -201,6 +218,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Print(args) => print(&cli, args).await,
         Cmd::Serve { config } => serve(config).await,
+        Cmd::Queue { action } => queue(&cli, *action).await,
         Cmd::Icons { query, emoji, limit } => {
             let q = query.join(" ");
             if *emoji {
@@ -635,4 +653,33 @@ async fn print_via_server(
         0 => Ok(()),
         _ => bail!("{}", failures.join("; ")),
     }
+}
+
+async fn queue(cli: &Cli, action: QueueAction) -> Result<()> {
+    let url = cli.server.as_deref().ok_or_else(|| anyhow!("needs --server or LWPRINT_SERVER"))?;
+    let c = client(cli, url)?;
+    let path = match action {
+        QueueAction::Hold => Some("/api/queue/hold"),
+        QueueAction::Release => Some("/api/queue/release"),
+        QueueAction::Clear => Some("/api/jobs/cancel"),
+        QueueAction::Show => None,
+    };
+    if let Some(p) = path {
+        let (code, body) = c.request("POST", p, None).await?;
+        if code != 200 {
+            return Err(client::error_of(code, &body));
+        }
+    }
+    let (code, st) = c.request("GET", "/api/status", None).await?;
+    if code != 200 {
+        return Err(client::error_of(code, &st));
+    }
+    let n = st["queue"].as_u64().unwrap_or(0);
+    let held = st["held"].as_bool().unwrap_or(false);
+    println!(
+        "{}, {n} label job{} waiting",
+        if held { "Holding labels" } else { "Printing normally" },
+        if n == 1 { "" } else { "s" }
+    );
+    Ok(())
 }

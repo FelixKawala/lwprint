@@ -7,6 +7,7 @@
 //!   lwprint/result         result of every finished job (and rejected requests)
 //!   lwprint/refresh        publish anything to check the printer now
 //!   lwprint/cancel         "all", a job id, or a request_id: stop printing
+//!   lwprint/hold           "on": hold labels instead of printing, "off": print held labels
 
 use crate::config::MqttConfig;
 use crate::service::{log, Event, PrintRequest, Service};
@@ -68,6 +69,12 @@ pub async fn run(svc: Arc<Service>, cfg: MqttConfig) {
                     svc.request_refresh();
                 } else if p.topic == format!("{base}/cancel") && !p.retain {
                     handle_cancel(&svc, &p.payload);
+                } else if p.topic == format!("{base}/hold") && !p.retain {
+                    match String::from_utf8_lossy(&p.payload).trim().to_ascii_lowercase().as_str() {
+                        "on" | "true" | "1" | "hold" => svc.set_held(true),
+                        "off" | "false" | "0" | "release" => svc.set_held(false),
+                        other => log(format!("MQTT: unknown hold command '{other}' (use on/off)")),
+                    }
                 }
             }
             Ok(_) => {}
@@ -143,6 +150,7 @@ async fn on_connect(client: &AsyncClient, svc: &Service, cfg: &MqttConfig, base:
     let _ = client.subscribe(format!("{base}/print"), QoS::AtLeastOnce).await;
     let _ = client.subscribe(format!("{base}/refresh"), QoS::AtLeastOnce).await;
     let _ = client.subscribe(format!("{base}/cancel"), QoS::AtLeastOnce).await;
+    let _ = client.subscribe(format!("{base}/hold"), QoS::AtLeastOnce).await;
     if !cfg.discovery_prefix.is_empty() {
         for (topic, payload) in discovery(svc, &cfg.discovery_prefix, base) {
             let _ = client.publish(topic, QoS::AtLeastOnce, true, payload.to_string()).await;
@@ -241,5 +249,16 @@ fn discovery(svc: &Service, prefix: &str, base: &str) -> Vec<(String, Value)> {
         o.insert("icon".into(), json!("mdi:printer-off"));
     }
     out.push((format!("{prefix}/button/{id}/cancel/config"), stop));
+    let mut hold = common("Hold labels", "hold");
+    if let Some(o) = hold.as_object_mut() {
+        o.insert("command_topic".into(), json!(format!("{base}/hold")));
+        o.insert("payload_on".into(), json!("on"));
+        o.insert("payload_off".into(), json!("off"));
+        o.insert("value_template".into(), json!("{{ 'on' if value_json.held else 'off' }}"));
+        o.insert("state_on".into(), json!("on"));
+        o.insert("state_off".into(), json!("off"));
+        o.insert("icon".into(), json!("mdi:pause-circle-outline"));
+    }
+    out.push((format!("{prefix}/switch/{id}/hold/config"), hold));
     out
 }
