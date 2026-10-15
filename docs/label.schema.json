@@ -47,9 +47,20 @@
       "description": "Service only. Print darkness."
     },
     "cut": {
-      "type": "boolean",
-      "default": true,
-      "description": "Service only. Cut after each label."
+      "oneOf": [
+        {
+          "enum": [
+            "each",
+            "end",
+            "none"
+          ]
+        },
+        {
+          "type": "boolean"
+        }
+      ],
+      "default": "each",
+      "description": "Service only. When to cut: after each label, only after the last one (one strip), or never. true/false mean each/none."
     },
     "rotate": {
       "type": "boolean",
@@ -163,8 +174,8 @@
             },
             "fill": {
               "type": "boolean",
-              "default": false,
-              "description": "Stretch to the full height with slightly uneven squares (larger, usually easier to scan on narrow tape)."
+              "default": true,
+              "description": "Stretch to the full height with slightly uneven squares (larger, easier to scan on narrow tape). false = equal squares."
             }
           }
         },

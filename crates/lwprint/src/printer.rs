@@ -20,12 +20,14 @@ pub struct Chunk {
     pub raster: bool,
 }
 
-/// A failed print, and whether anything may have been printed.
+/// A failed print, and how far it got.
 #[derive(Debug)]
 pub struct PrintFailure {
     /// False if the error happened before any image data was sent; such a print can
     /// safely be tried again without risking a duplicate label.
     pub started: bool,
+    /// Labels completely sent to the printer before the error.
+    pub pages_sent: usize,
     pub error: anyhow::Error,
 }
 
@@ -37,19 +39,43 @@ impl std::fmt::Display for PrintFailure {
 
 impl std::error::Error for PrintFailure {}
 
-/// The complete byte sequence of one print job, in the order it is sent.
-pub fn job_chunks(label: &Bitmap, opts: &JobOptions, orientation: Orientation) -> Vec<Chunk> {
-    let none = Duration::ZERO;
-    let mut chunks = vec![
-        Chunk { data: protocol::auto_status_request(), pause: none, raster: false },
-        Chunk { data: protocol::job_setup(opts), pause: none, raster: false },
-        Chunk { data: protocol::page_setup(label.width() as u32, 0), pause: none, raster: false },
-    ];
+/// Result of a job that ran to its end (possibly stopped early on request).
+#[derive(Debug)]
+pub struct PrintOutcome {
+    /// Labels sent and printed; fewer than requested if stopping was requested.
+    pub pages_sent: usize,
+    /// A problem reported by the printer that did not prevent printing (e.g. low voltage).
+    pub warning: Option<String>,
+}
+
+fn job_start(opts: &JobOptions) -> Vec<Chunk> {
+    vec![
+        Chunk { data: protocol::auto_status_request(), pause: Duration::ZERO, raster: false },
+        Chunk { data: protocol::job_setup(opts), pause: Duration::ZERO, raster: false },
+    ]
+}
+
+fn page_chunks(label: &Bitmap, orientation: Orientation) -> Vec<Chunk> {
+    let mut chunks = vec![Chunk {
+        data: protocol::page_setup(label.width() as u32, 0),
+        pause: Duration::ZERO,
+        raster: false,
+    }];
     for band in protocol::raster_bands(label, orientation) {
         chunks.push(Chunk { data: band, pause: BAND_PAUSE, raster: true });
     }
-    chunks.push(Chunk { data: protocol::page_end(), pause: none, raster: false });
-    chunks.push(Chunk { data: protocol::job_end(), pause: none, raster: false });
+    chunks.push(Chunk { data: protocol::page_end(), pause: Duration::ZERO, raster: false });
+    chunks
+}
+
+/// The complete byte sequence of a job with one page per label, in sending order.
+/// All labels share one job, so the printer handles cutting between them itself.
+pub fn job_chunks(pages: &[Bitmap], opts: &JobOptions, orientation: Orientation) -> Vec<Chunk> {
+    let mut chunks = job_start(opts);
+    for page in pages {
+        chunks.extend(page_chunks(page, orientation));
+    }
+    chunks.push(Chunk { data: protocol::job_end(), pause: Duration::ZERO, raster: false });
     chunks
 }
 
@@ -127,30 +153,38 @@ impl Printer {
             .context("the printer did not answer the status request")
     }
 
-    /// Print one label and wait until the printer reports the job finished.
-    /// `settle` is an extra pause between the status check and the job.
-    /// Returns a warning if the label printed but the printer reported a minor problem.
-    pub async fn print(
+    /// Print labels as one job (one page each) and wait until the printer reports the
+    /// job finished. `should_stop` is checked between labels; when it returns true, no
+    /// further labels are sent and the job is ended normally, so labels already sent
+    /// still print. `on_page_sent` is called with the number of labels sent so far.
+    pub async fn print_pages(
         &mut self,
-        label: &Bitmap,
+        pages: &[Bitmap],
         opts: &JobOptions,
         orientation: Orientation,
         settle: Duration,
-    ) -> Result<Option<String>, PrintFailure> {
+        should_stop: &(dyn Fn() -> bool + Send + Sync),
+        on_page_sent: &mut (dyn FnMut(usize) + Send),
+    ) -> Result<PrintOutcome, PrintFailure> {
         let mut started = false;
-        self.print_inner(label, opts, orientation, settle, &mut started)
+        let mut pages_sent = 0;
+        self.print_inner(pages, opts, orientation, settle, should_stop, on_page_sent, &mut started, &mut pages_sent)
             .await
-            .map_err(|error| PrintFailure { started, error })
+            .map_err(|error| PrintFailure { started, pages_sent, error })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn print_inner(
         &mut self,
-        label: &Bitmap,
+        pages: &[Bitmap],
         opts: &JobOptions,
         orientation: Orientation,
         settle: Duration,
+        should_stop: &(dyn Fn() -> bool + Send + Sync),
+        on_page_sent: &mut (dyn FnMut(usize) + Send),
         started: &mut bool,
-    ) -> Result<Option<String>> {
+        pages_sent: &mut usize,
+    ) -> Result<PrintOutcome> {
         let st = self.status().await?;
         if !st.is_ready() {
             bail!("{}", describe_problem(&st));
@@ -159,26 +193,42 @@ impl Printer {
             self.log(&format!("waiting {} ms before the job", settle.as_millis()));
             sleep(settle).await;
         }
-        for chunk in job_chunks(label, opts, orientation) {
-            if chunk.raster {
-                *started = true;
-            }
+        for chunk in job_start(opts) {
             self.send(&chunk.data).await?;
-            if !chunk.pause.is_zero() {
-                sleep(chunk.pause).await;
-            }
         }
+        let mut total_mm = 0.0f32;
+        for (i, page) in pages.iter().enumerate() {
+            if i > 0 && should_stop() {
+                self.log(&format!("stop requested; ending the job after {i} labels"));
+                break;
+            }
+            for chunk in page_chunks(page, orientation) {
+                if chunk.raster {
+                    *started = true;
+                }
+                self.send(&chunk.data).await?;
+                if !chunk.pause.is_zero() {
+                    sleep(chunk.pause).await;
+                }
+            }
+            // Don't run far ahead of the printer, so that a stop request takes effect
+            // after the labels already sent.
+            self.wait_until_sent(Duration::from_secs(120)).await?;
+            *pages_sent = i + 1;
+            total_mm += page.width() as f32 * 25.4 / 180.0;
+            on_page_sent(*pages_sent);
+        }
+        self.send(&protocol::job_end()).await?;
 
         // Sent data only reaches the kernel; wait until it has really gone out over
         // Bluetooth before doing anything else (closing early loses the rest of the image).
         self.wait_until_sent(Duration::from_secs(60)).await?;
 
-        // Then poll the status until the label is done. The printer reports
-        // "printing" (ST 02) while working and "print finished" (ST 05) at the end.
-        // It answers the automatic-status command right away with a stale idle
-        // report, so idle only counts after "printing" was seen or enough time passed.
-        let label_mm = label.width() as f32 * 25.4 / 180.0;
-        let fallback = Duration::from_millis(4000 + (label_mm * 300.0) as u64);
+        // Then poll the status until the job is done. The printer reports "printing"
+        // (ST 02) while working and "print finished" (ST 05) at the end. It answers the
+        // automatic-status command right away with a stale idle report, so idle only
+        // counts after "printing" was seen or after enough time for the labels.
+        let fallback = Duration::from_millis(4000 + (total_mm * 300.0) as u64);
         let give_up = Duration::from_secs(60) + fallback;
         let start = Instant::now();
         let mut seen_busy = false;
@@ -204,17 +254,17 @@ impl Printer {
                         bail!(
                             "{}{}",
                             describe_problem(&s),
-                            if finished { " (the label was printed, but check it)" } else { "" }
+                            if finished { " (labels were printed, but check them)" } else { "" }
                         );
                     }
                     if finished {
-                        return Ok(warning);
+                        return Ok(PrintOutcome { pages_sent: *pages_sent, warning });
                     }
                 }
             }
             sleep(Duration::from_millis(500)).await;
         }
-        bail!("the printer did not finish within {}s; check the label", give_up.as_secs())
+        bail!("the printer did not finish within {}s; check the labels", give_up.as_secs())
     }
 
     /// Wait until the kernel has transmitted everything written to the socket.
@@ -248,4 +298,25 @@ pub fn describe_problem(s: &Status) -> String {
         return format!("printer is busy ({})", protocol::state_name(s.state()));
     }
     "printer is ready".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copies_share_one_job() {
+        let label = Bitmap::new(10, 72);
+        let opts = JobOptions::default();
+        let bytes: Vec<u8> = job_chunks(&[label.clone(), label.clone(), label], &opts, Orientation::Normal)
+            .into_iter()
+            .flat_map(|c| c.data)
+            .collect();
+        let count = |pat: &[u8]| bytes.windows(pat.len()).filter(|w| *w == pat).count();
+        assert_eq!(count(&protocol::job_setup(&opts)), 1, "one job setup");
+        assert_eq!(count(&[0x1B, 0x7B, 0x07, 0x4C]), 3, "one page setup per label");
+        assert_eq!(count(&protocol::job_end()), 2, "reset at the start of the job setup and one job end");
+        assert_eq!(bytes.iter().filter(|&&b| b == 0x0C).count() >= 3, true);
+        assert!(bytes.ends_with(&[0x0C, 0x1B, 0x7B, 0x03, 0x40, 0x40, 0x7D]));
+    }
 }

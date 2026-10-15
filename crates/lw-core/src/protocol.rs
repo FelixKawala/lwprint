@@ -31,24 +31,34 @@ pub fn auto_status_request() -> Vec<u8> {
     frame(0x51, &[0x05, 0x00])
 }
 
+/// When the printer cuts the tape during a job.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CutMode {
+    /// Cut after every label.
+    #[default]
+    Each,
+    /// Cut only after the last label of the job (one strip).
+    End,
+    /// Never cut.
+    None,
+}
+
 /// Job-level settings.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct JobOptions {
     /// Print density from -5 (light) to +5 (dark); 0 is the printer default.
     pub density: i8,
-    /// Cut the tape after the label.
-    pub cut: bool,
-}
-
-impl Default for JobOptions {
-    fn default() -> Self {
-        Self { density: 0, cut: true }
-    }
+    pub cut: CutMode,
 }
 
 /// Commands that start a job (byte-identical to Epson's library for the LW-C410).
 pub fn job_setup(opts: &JobOptions) -> Vec<u8> {
-    let cut: [u8; 4] = if opts.cut { [1, 1, 1, 1] } else { [0, 0, 0, 0] };
+    let cut: [u8; 4] = match opts.cut {
+        CutMode::Each => [1, 1, 1, 1],
+        CutMode::End => [1, 0, 1, 1],
+        CutMode::None => [0, 0, 0, 0],
+    };
     let density = (opts.density.clamp(-5, 5) + 5) as u8;
     let mut out = frame(0x40, &[]);
     out.extend(frame(0x7B, &[0x00, 0x00, b'S', b'T']));
@@ -282,8 +292,10 @@ mod tests {
             "1b 7b 03 40 40 7d 1b 7b 07 7b 00 00 53 54 22 7d 1b 7b 07 43 01 01 01 01 47 7d \
              1b 7b 04 44 05 49 7d 1b 7b 03 47 47 7d"
         );
-        let no_cut = job_setup(&JobOptions { density: -5, cut: false });
+        let no_cut = job_setup(&JobOptions { density: -5, cut: CutMode::None });
         assert!(hex(&no_cut).contains("1b 7b 07 43 00 00 00 00 43 7d 1b 7b 04 44 00 44 7d"));
+        let at_end = job_setup(&JobOptions { density: 0, cut: CutMode::End });
+        assert!(hex(&at_end).contains("1b 7b 07 43 01 00 01 01 46 7d"));
         assert_eq!(hex(&page_setup(500, 0)), "1b 7b 07 4c f4 01 00 00 41 7d 1b 7b 05 54 00 00 54 7d");
         assert_eq!(hex(&page_setup(300, 20)), "1b 7b 07 4c 2c 01 00 00 79 7d 1b 7b 05 54 14 00 68 7d");
         assert_eq!(hex(&job_end()), "1b 7b 03 40 40 7d");

@@ -52,8 +52,11 @@ HTTP / MQTT ─► Service::submit ─► queue ─► worker ─► wait_for_pr
   change while a job waits.
 * **Retry automatically only before any image data was sent** (`PrintFailure::started`).
   After that, a retry could print a duplicate, so it is left to the user (`retry`).
-* **A printing job stops after the current label** when cancelled; interrupting a label
-  wastes tape and may leave the printer in an odd state.
+* **Copies (and pages) go into one printer job**, like Epson's app does: one job setup,
+  a page per label, one job end. The printer's firmware then cuts between labels itself
+  instead of feeding the blank lead for every label. Pages are sent one at a time and
+  the kernel queue is drained after each, so a stop request ends the job after the
+  labels already sent; they still print and the job ends normally (never mid-label).
 * **Never abandon a print mid-job.** Errors reported while `ST` says printing are
   remembered and reported after the printer finishes or stops on its own.
 * **The service only accepts embedded images (data: URLs)**, so requests can't read files
@@ -138,12 +141,16 @@ every send, the kernel queue drain time and every status report.
 
 ## Not yet confirmed on paper
 
-Density other than 0, `--no-cut`, `--rotate`, multiple copies in one job, images,
+Density other than 0, cut modes `end` and `none`, `--rotate`, multiple copies in one
+job (and how much tape it saves), images,
 barcodes, icons and emoji, 4/6/9/18 mm tape, borders, the service end to end on the target VM, Home
 Assistant discovery against a real Home Assistant.
 
 ## Ideas / roadmap
 
+* Batch printing of *different* labels: merge queued jobs with the same density and cut
+  mode into one printer job, so a series of labels (e.g. from an automation) shares one
+  blank lead. Depends on how much the one-job copies save in practice.
 * Free layout mode: absolutely positioned and scalable elements with a canvas editor,
   next to the list editor.
 * Public browser version: compile `lw-core` to WebAssembly and print via Web Serial

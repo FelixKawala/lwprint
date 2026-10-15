@@ -8,7 +8,7 @@ pub mod render;
 
 pub use bitmap::Bitmap;
 pub use model::{Model, Tape, LW_C410};
-pub use protocol::{JobOptions, Orientation, Status, StatusReader};
+pub use protocol::{CutMode, JobOptions, Orientation, Status, StatusReader};
 pub use render::{
     render, Border, Element, HAlign, IconFont, Item, LabelSpec, RenderContext, RenderError, Symbology, VAlign,
 };

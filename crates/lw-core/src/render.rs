@@ -34,6 +34,10 @@ pub enum Symbology {
     Code39,
 }
 
+fn yes() -> bool {
+    true
+}
+
 fn default_module() -> usize {
     2
 }
@@ -88,9 +92,9 @@ pub enum Element {
         #[serde(default)]
         size_mm: Option<f32>,
         /// Fill the available height with squares of slightly uneven size (mixing whole
-        /// pixel widths) instead of equal squares; larger on average, but scanners must
-        /// cope with the unevenness. The tape edge serves as the white border.
-        #[serde(default)]
+        /// pixel widths) instead of equal squares; larger on average and easier to scan
+        /// on narrow tape. The tape edge serves as the white border. On by default.
+        #[serde(default = "yes")]
         fill: bool,
     },
     /// Icon from the icon font by name (Material Design Icons, e.g. "screwdriver" or

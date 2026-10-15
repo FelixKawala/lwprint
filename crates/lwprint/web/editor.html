@@ -315,7 +315,13 @@ dialog::backdrop { background: rgba(15, 20, 18, 0.45); }
           <input type="number" id="copies" min="1" max="50" value="1">
         </div>
         <div class="field">
-          <label class="inline"><input type="checkbox" id="cut" checked> Cut after each label</label>
+          <label for="cut">Cutting</label>
+          <select id="cut">
+            <option value="each">After each label</option>
+            <option value="end">Only after the last label (one strip)</option>
+            <option value="none">Don't cut</option>
+          </select>
+          <div class="hint">Copies print as one job, so the blank lead at the start is only needed once.</div>
         </div>
         <div class="field">
           <label class="inline"><input type="checkbox" id="rotate"> Turn label upside down</label>
@@ -396,7 +402,7 @@ dialog::backdrop { background: rgba(15, 20, 18, 0.45); }
     const defaults = {
       text: { text: "", align: "center", size: null },
       icon: { name: null, codepoint: null, size: null },
-      qr: { data: "", size: null, fill: false },
+      qr: { data: "", size: null, fill: true },
       barcode: { data: "", symbology: "code128", height: null },
       image: { data: null, dither: false, height: null },
       space: { mm: 5 },
@@ -417,8 +423,8 @@ dialog::backdrop { background: rgba(15, 20, 18, 0.45); }
         return Object.assign({ type: "icon", name: e.name }, e.size ? { size_mm: e.size } : {}, extra);
       case "qr":
         if (!e.data.trim()) return null;
-        return Object.assign({ type: "qr", data: e.data.trim() }, e.size ? { size_mm: e.size } : {},
-          e.fill ? { fill: true } : {}, extra);
+        return Object.assign({ type: "qr", data: e.data.trim(), fill: e.fill !== false },
+          e.size ? { size_mm: e.size } : {}, extra);
       case "barcode":
         if (!e.data.trim()) return null;
         return Object.assign({ type: "barcode", data: e.data.trim(), symbology: e.symbology, module_px: 2 },
@@ -443,7 +449,7 @@ dialog::backdrop { background: rgba(15, 20, 18, 0.45); }
       border: $("border").value,
       density: Number($("density").value),
       copies: Math.max(1, Math.min(50, Number($("copies").value) || 1)),
-      cut: $("cut").checked,
+      cut: $("cut").value,
       rotate: $("rotate").checked,
     };
     const minLen = num($("min-length").value);
@@ -522,7 +528,7 @@ dialog::backdrop { background: rgba(15, 20, 18, 0.45); }
             h("label", { class: "inline" },
               h("input", { type: "checkbox", id: p + "fill", checked: e.fill, onchange: (ev) => set("fill")(ev.target.checked) }),
               "Fill the tape height"),
-            h("div", { class: "hint", text: "Larger code with slightly uneven squares. Usually easier to scan on narrow tape." })),
+            h("div", { class: "hint", text: "Larger code with slightly uneven squares; easier to scan on narrow tape. Turn off for equal squares." })),
         ];
       }
       case "barcode": {
@@ -623,8 +629,9 @@ dialog::backdrop { background: rgba(15, 20, 18, 0.45); }
     if (saved && Array.isArray(saved.els)) {
       els = saved.els.filter((e) => KINDS[e.type]);
       nextId = els.reduce((m, e) => Math.max(m, e.id || 0), 0) + 1;
-      for (const [id, v] of Object.entries(saved.settings || {})) {
+      for (let [id, v] of Object.entries(saved.settings || {})) {
         if (!$(id)) continue;
+        if (id === "cut" && typeof v === "boolean") v = v ? "each" : "none";
         if ($(id).type === "checkbox") $(id).checked = !!v; else $(id).value = v;
       }
       $("density-out").textContent = $("density").value;
@@ -707,8 +714,8 @@ dialog::backdrop { background: rgba(15, 20, 18, 0.45); }
   function describeJob(job) {
     if (job.state === "waiting" && job.message) return job.message.replace(/^waiting: /, "Waiting: ");
     if (job.state === "printing") {
-      const progress = job.copies > 1 ? ` label ${Math.min(job.copies_done + 1, job.copies)} of ${job.copies}` : "";
-      return job.stopping ? `Printing${progress}, stopping after this label` : `Printing${progress}…`;
+      const progress = job.copies > 1 ? `, ${job.copies_done} of ${job.copies} sent to the printer` : "";
+      return job.stopping ? `Printing${progress}; stopping after the labels already sent` : `Printing${progress}…`;
     }
     const word = jobWords[job.state] || job.state;
     return job.message ? `${word}: ${job.message}` : word;

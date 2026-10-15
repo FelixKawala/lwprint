@@ -58,6 +58,13 @@ enum Cmd {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
+enum CutArg {
+    Each,
+    End,
+    None,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum BorderArg {
     None,
     Line,
@@ -81,9 +88,9 @@ struct PrintArgs {
     /// QR code content
     #[arg(long)]
     qr: Option<String>,
-    /// Stretch the QR code to the full tape height (slightly uneven squares)
+    /// Use equal QR squares instead of filling the tape height (fill is the default)
     #[arg(long)]
-    qr_fill: bool,
+    qr_equal: bool,
     /// Icon name from Material Design Icons (see `lwprint icons <search>`); repeat for more
     #[arg(long)]
     icon: Vec<String>,
@@ -123,8 +130,11 @@ struct PrintArgs {
     #[arg(long, default_value_t = 0, allow_hyphen_values = true,
           value_parser = clap::value_parser!(i8).range(-5..=5))]
     density: i8,
-    /// Do not cut the tape after the label
-    #[arg(long)]
+    /// When to cut: after each label, only after the last one (one strip), or never
+    #[arg(long, value_enum, default_value = "each")]
+    cut: CutArg,
+    /// Same as --cut none
+    #[arg(long, hide = true)]
     no_cut: bool,
     /// Number of labels to print
     #[arg(long, default_value_t = 1)]
@@ -227,7 +237,12 @@ async fn print(cli: &Cli, args: &PrintArgs) -> Result<()> {
     };
 
     let orientation = if args.rotate { Orientation::Rotated } else { Orientation::Normal };
-    let opts = JobOptions { density: args.density, cut: !args.no_cut };
+    let cut = match (args.no_cut, args.cut) {
+        (true, _) | (_, CutArg::None) => lw_core::CutMode::None,
+        (_, CutArg::End) => lw_core::CutMode::End,
+        (_, CutArg::Each) => lw_core::CutMode::Each,
+    };
+    let opts = JobOptions { density: args.density, cut };
 
     if args.preview.is_some() || args.dump.is_some() {
         let tape = requested_tape.unwrap_or(LW_C410.tape_by_mm(12).unwrap());
@@ -253,7 +268,8 @@ async fn print(cli: &Cli, args: &PrintArgs) -> Result<()> {
             );
         }
         if let Some(out) = &args.dump {
-            let bytes: Vec<u8> = printer::job_chunks(&label, &opts, orientation)
+            let pages = vec![label.clone(); args.copies.max(1) as usize];
+            let bytes: Vec<u8> = printer::job_chunks(&pages, &opts, orientation)
                 .into_iter()
                 .flat_map(|c| c.data)
                 .collect();
@@ -283,13 +299,24 @@ async fn print(cli: &Cli, args: &PrintArgs) -> Result<()> {
         };
     let label = render(&spec, &ctx)?;
     let settle = std::time::Duration::from_millis(args.settle_ms);
-    let copies = args.copies.max(1);
-    for n in 1..=copies {
-        if let Some(warning) = p.print(&label, &opts, orientation, settle).await? {
-            eprintln!("warning: {warning}");
-        }
-        println!("Printed label {n}/{copies} ({} mm tape, {:.0} mm long)", tape.mm, length_mm(label.width()));
+    let copies = args.copies.max(1) as usize;
+    let pages = vec![label.clone(); copies];
+    let out = p
+        .print_pages(&pages, &opts, orientation, settle, &|| false, &mut |n| {
+            if copies > 1 {
+                eprintln!("sent label {n} of {copies}");
+            }
+        })
+        .await?;
+    if let Some(warning) = out.warning {
+        eprintln!("warning: {warning}");
     }
+    println!(
+        "Printed {} ({} mm tape, {:.0} mm long each)",
+        if copies == 1 { "1 label".to_string() } else { format!("{copies} labels") },
+        tape.mm,
+        length_mm(label.width())
+    );
     Ok(())
 }
 
@@ -329,7 +356,7 @@ fn build_spec(args: &PrintArgs) -> Result<(LabelSpec, PathBuf)> {
             elements.push(Element::Icon { name: name.clone(), size_mm: None });
         }
         if let Some(data) = &args.qr {
-            elements.push(Element::Qr { data: data.clone(), size_mm: None, fill: args.qr_fill });
+            elements.push(Element::Qr { data: data.clone(), size_mm: None, fill: !args.qr_equal });
         }
         if !args.text.is_empty() {
             elements.push(Element::Text {

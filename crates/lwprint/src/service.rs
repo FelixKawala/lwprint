@@ -10,7 +10,7 @@ use lw_core::IconFont;
 use anyhow::{anyhow, Context, Result};
 use bluer::Address;
 use lw_core::protocol::state_name;
-use lw_core::{render, Bitmap, JobOptions, LabelSpec, Orientation, RenderContext, Status, Tape, LW_C410};
+use lw_core::{render, Bitmap, CutMode, JobOptions, LabelSpec, Orientation, RenderContext, Status, Tape, LW_C410};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,9 +25,6 @@ const RETRY_PAUSE: Duration = Duration::from_secs(15);
 fn one() -> u32 {
     1
 }
-fn yes() -> bool {
-    true
-}
 
 /// A print (or preview) request: a label plus print options, as one JSON object.
 #[derive(Debug, Clone, Deserialize)]
@@ -38,8 +35,10 @@ pub struct PrintRequest {
     pub copies: u32,
     #[serde(default)]
     pub density: i8,
-    #[serde(default = "yes")]
-    pub cut: bool,
+    /// "each" (default), "end" (one strip, cut after the last label) or "none";
+    /// `true`/`false` mean "each"/"none".
+    #[serde(default)]
+    pub cut: CutField,
     #[serde(default)]
     pub rotate: bool,
     /// Tape width the label is meant for; printing fails if a different tape is inserted.
@@ -52,6 +51,44 @@ pub struct PrintRequest {
     /// Name of the person or automation printing (shown in the job list; not verified).
     #[serde(default)]
     pub requested_by: Option<String>,
+}
+
+/// The `cut` field: a cut mode, or a plain boolean for compatibility.
+#[derive(Debug, Clone, Copy)]
+pub enum CutField {
+    Bool(bool),
+    Mode(CutMode),
+}
+
+impl<'de> Deserialize<'de> for CutField {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match serde_json::Value::deserialize(d)? {
+            serde_json::Value::Bool(b) => Ok(CutField::Bool(b)),
+            serde_json::Value::String(s) => match s.as_str() {
+                "each" => Ok(CutField::Mode(CutMode::Each)),
+                "end" => Ok(CutField::Mode(CutMode::End)),
+                "none" => Ok(CutField::Mode(CutMode::None)),
+                _ => Err(serde::de::Error::custom("cut must be \"each\", \"end\", \"none\", true or false")),
+            },
+            _ => Err(serde::de::Error::custom("cut must be \"each\", \"end\", \"none\", true or false")),
+        }
+    }
+}
+
+impl Default for CutField {
+    fn default() -> Self {
+        CutField::Mode(CutMode::Each)
+    }
+}
+
+impl CutField {
+    pub fn mode(self) -> CutMode {
+        match self {
+            CutField::Bool(true) => CutMode::Each,
+            CutField::Bool(false) => CutMode::None,
+            CutField::Mode(m) => m,
+        }
+    }
 }
 
 impl PrintRequest {
@@ -360,8 +397,8 @@ impl Service {
         self.enqueue(Arc::new(req), source, Some(id))
     }
 
-    /// Stop a job. Queued or waiting jobs stop right away; a printing job stops after the
-    /// current label, because interrupting a label would waste tape.
+    /// Stop a job. Queued or waiting jobs stop right away; a printing job sends no further
+    /// labels and ends normally, so labels already sent to the printer still print.
     pub fn cancel(&self, id: u64) -> Result<JobInfo> {
         let info = {
             let mut jobs = self.jobs.lock().unwrap();
@@ -372,7 +409,7 @@ impl Service {
             j.cancel.store(true, Ordering::SeqCst);
             if j.info.state == JobState::Printing {
                 j.info.stopping = true;
-                j.info.message = Some("stopping after the current label".into());
+                j.info.message = Some("stopping after the labels already sent to the printer".into());
             }
             j.info.clone()
         };
@@ -562,7 +599,7 @@ impl Service {
             return self.finish_job(id, JobState::Cancelled, "nothing was printed".into());
         }
         let deadline = Instant::now() + Duration::from_secs(self.config.printer.retry_minutes * 60);
-        let opts = JobOptions { density: req.density, cut: req.cut };
+        let opts = JobOptions { density: req.density, cut: req.cut.mode() };
         let orientation = if req.rotate { Orientation::Rotated } else { Orientation::Normal };
         let mut done = 0u32;
         let mut warnings: Vec<String> = Vec::new();
@@ -590,31 +627,49 @@ impl Service {
             last_length = label.width() as f32 * 25.4 / LW_C410.dpi as f32;
             self.set_job_state(id, JobState::Printing, None);
 
-            while done < req.copies {
-                if self.is_cancelled(id) {
-                    break 'connect;
+            if self.is_cancelled(id) {
+                break 'connect;
+            }
+            // All remaining copies go into one printer job, so the printer cuts between
+            // them without feeding blank tape for every label.
+            let base = done;
+            let pages: Vec<Bitmap> = (base..req.copies).map(|_| label.clone()).collect();
+            let stop = || self.is_cancelled(id);
+            let mut on_sent = |n: usize| {
+                self.update_job(id, |j| j.copies_done = base + n as u32);
+                self.publish_status();
+            };
+            match p.print_pages(&pages, &opts, orientation, Duration::ZERO, &stop, &mut on_sent).await {
+                Ok(out) => {
+                    done = base + out.pages_sent as u32;
+                    warnings.extend(out.warning);
+                    self.update_job(id, |j| j.copies_done = done);
+                    if done < req.copies {
+                        // Fewer labels than requested only happens when stopping was requested.
+                        break 'connect;
+                    }
                 }
-                match p.print(&label, &opts, orientation, Duration::ZERO).await {
-                    Ok(w) => {
-                        done += 1;
-                        warnings.extend(w);
-                        self.update_job(id, |j| j.copies_done = done);
-                        self.publish_status();
+                Err(f) if !f.started && Instant::now() < deadline => {
+                    // Nothing was printed, so trying again cannot produce a duplicate.
+                    log(format!("job {id}: not started ({f}); retrying"));
+                    self.set_job_state(id, JobState::Waiting, Some(format!("waiting: retrying after: {f}")));
+                    sleep(Duration::from_secs(3)).await;
+                    continue 'connect;
+                }
+                Err(f) => {
+                    if let Ok(s) = p.status().await {
+                        self.set_status(&s);
                     }
-                    Err(f) if !f.started && Instant::now() < deadline => {
-                        // Nothing was printed, so trying again cannot produce a duplicate.
-                        log(format!("job {id}: label {} not started ({f}); retrying", done + 1));
-                        self.set_job_state(id, JobState::Waiting, Some(format!("waiting: retrying after: {f}")));
-                        sleep(Duration::from_secs(3)).await;
-                        continue 'connect;
-                    }
-                    Err(f) => {
-                        if let Ok(s) = p.status().await {
-                            self.set_status(&s);
-                        }
-                        let msg = format!("label {} of {}: {f}", done + 1, req.copies);
-                        return self.finish_job(id, JobState::Failed, self.with_progress(msg, done, &req));
-                    }
+                    // The label being sent or printed when the error happened may be
+                    // incomplete, so a retry prints it again.
+                    let sent = base + f.pages_sent as u32;
+                    self.update_job(id, |j| j.copies_done = sent.saturating_sub(1).max(base));
+                    let msg = if req.copies > 1 {
+                        format!("{f} ({sent} of {} labels were sent; check which ones printed)", req.copies)
+                    } else {
+                        format!("{f}")
+                    };
+                    return self.finish_job(id, JobState::Failed, msg);
                 }
             }
             if let Ok(s) = p.status().await {
