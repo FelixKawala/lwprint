@@ -1,0 +1,21 @@
+# Configuration for `lwprint serve`. Copy to /etc/lwprint.toml and adjust.
+
+[printer]
+address = "44:B7:D0:64:FC:0E"
+# channel = 6                  # looked up automatically if omitted
+# font = "DejaVu Sans"         # font family or path to a .ttf/.otf file
+status_interval_secs = 300     # check the printer every 5 minutes while idle (0 = off)
+retry_minutes = 10             # how long a job waits for the printer before it fails
+
+[http]
+listen = "0.0.0.0:8080"
+# token = "change-me"          # require "Authorization: Bearer change-me" for the API
+
+# Remove this section to disable MQTT.
+[mqtt]
+host = "homeassistant.lan"
+port = 1883
+# username = "lwprint"
+# password = "secret"
+base_topic = "lwprint"
+discovery_prefix = "homeassistant"   # "" disables Home Assistant discovery

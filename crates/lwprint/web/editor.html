@@ -1,0 +1,880 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Label printer</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #e9ece8;
+  --surface: #f7f8f6;
+  --ink: #1d2326;
+  --muted: #5b666b;
+  --line: #c5ccc7;
+  --accent: #f0b323;
+  --accent-ink: #1d2326;
+  --ok: #2f7d4f;
+  --warn: #a35f00;
+  --bad: #b3261e;
+  --tape: #ffffff;
+  --tape-edge: #d6dbd8;
+  --radius-s: 4px;
+  --radius-m: 8px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #171b1d;
+    --surface: #212729;
+    --ink: #e3e7e5;
+    --muted: #9aa5aa;
+    --line: #3a4347;
+    --ok: #6fc48f;
+    --warn: #e7a84b;
+    --bad: #ff8a80;
+    --tape-edge: #8d9692;
+  }
+}
+@font-face { font-family: "MDI"; src: url("assets/mdi.ttf") format("truetype"); font-display: block; }
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+main { max-width: 1080px; margin: 0 auto; padding: 20px 20px 96px; }
+header {
+  display: flex; flex-wrap: wrap; gap: 8px 16px;
+  align-items: baseline; justify-content: space-between;
+  margin-bottom: 20px;
+}
+h1 { font-size: 1.5rem; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+h2 { font-size: 1rem; font-weight: 650; margin: 0; }
+.mdi { font-family: "MDI"; font-style: normal; font-weight: normal; line-height: 1; }
+.printer { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 0.9375rem; }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
+.dot.ok { background: var(--ok); }
+.dot.warn { background: var(--warn); }
+.dot.bad { background: var(--bad); }
+
+/* The tape strip: the one bold element of the page. */
+.stage { overflow-x: auto; padding: 28px 0 8px; margin: 0 -20px; scrollbar-width: thin; }
+.tape {
+  display: inline-flex; align-items: center;
+  margin: 0 20px;
+  background: var(--tape);
+  border-top: 1px solid var(--tape-edge);
+  border-bottom: 1px solid var(--tape-edge);
+  box-shadow: 0 10px 18px -12px rgba(20, 30, 25, 0.45);
+  position: relative;
+  min-height: 60px;
+  transition: opacity 0.15s;
+}
+.tape.loading { opacity: 0.55; }
+.tape img { display: block; image-rendering: pixelated; image-rendering: crisp-edges; }
+.tape::before, .tape::after {
+  content: ""; position: absolute; top: -10px; bottom: -10px; width: 0;
+  border-left: 1px dashed var(--muted);
+}
+.tape::before { left: 0; }
+.tape::after { right: 0; }
+.stage-note { color: var(--muted); font-size: 0.875rem; margin: 6px 0 0; min-height: 1.5em; }
+.stage-note.error { color: var(--bad); }
+.stage-hint { color: var(--warn); font-size: 0.875rem; margin: 2px 0 0; max-width: 70ch; }
+
+.columns {
+  display: grid; gap: 20px; align-items: start;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  margin-top: 24px;
+}
+@media (max-width: 800px) { .columns { grid-template-columns: 1fr; } }
+.side { display: grid; gap: 20px; }
+section {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-m);
+  padding: 18px;
+}
+.section-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 14px; }
+.field { margin-bottom: 14px; }
+.field:last-child { margin-bottom: 0; }
+label, .label { display: block; font-size: 0.875rem; font-weight: 600; margin-bottom: 4px; }
+.hint { color: var(--muted); font-size: 0.8125rem; margin-top: 4px; }
+input[type=text], input[type=number], input[type=password], select, textarea {
+  width: 100%;
+  font: inherit;
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-s);
+  padding: 7px 10px;
+}
+textarea { resize: vertical; min-height: 4.2em; }
+.row { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+.grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.inline { display: flex; align-items: center; gap: 8px; font-weight: 400; font-size: 0.9375rem; margin: 0; }
+.inline input { width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+.range-row { display: grid; grid-template-columns: 1fr 2.5em; align-items: center; gap: 8px; }
+.range-row output { text-align: right; font-variant-numeric: tabular-nums; }
+
+button {
+  font: inherit; cursor: pointer;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--line);
+  background: transparent; color: var(--ink);
+  padding: 6px 12px;
+}
+button:hover { border-color: var(--muted); }
+button.primary {
+  background: var(--accent); color: var(--accent-ink);
+  border-color: var(--accent);
+  font-weight: 650; padding: 10px 22px; font-size: 1rem;
+}
+button.primary:hover { filter: brightness(1.05); }
+button:disabled { opacity: 0.4; cursor: default; }
+button.icon-btn { padding: 4px 7px; display: inline-flex; align-items: center; }
+button.icon-btn .mdi { font-size: 20px; }
+.linkish { border: none; padding: 2px 0; text-decoration: underline; text-underline-offset: 3px; font-size: 0.875rem; }
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+
+/* Element list */
+.elements { list-style: none; margin: 0 0 14px; padding: 0; display: grid; gap: 10px; }
+.el { border: 1px solid var(--line); border-radius: var(--radius-s); background: var(--bg); }
+.el-head { display: flex; align-items: center; gap: 8px; padding: 6px 8px 6px 12px; border-bottom: 1px solid var(--line); }
+.el-head .mdi.kind { font-size: 18px; color: var(--muted); }
+.el-title { font-weight: 600; font-size: 0.9375rem; flex: 1; }
+.el-actions { display: flex; gap: 4px; }
+.el-actions button { border-color: transparent; }
+.el-actions button:hover:not(:disabled) { border-color: var(--line); }
+.el-body { padding: 12px; display: grid; gap: 10px; }
+.el-body .field { margin: 0; }
+.el-body input, .el-body select, .el-body textarea { background: var(--surface); }
+.icon-pick { display: flex; align-items: center; gap: 10px; }
+.icon-pick .mdi { font-size: 34px; }
+.thumb { max-height: 40px; max-width: 120px; border: 1px solid var(--line); background: #fff; }
+.add-bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.add-bar .label { margin: 0 4px 0 0; }
+.add-bar button { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; }
+.add-bar .mdi { font-size: 18px; }
+
+.printbar {
+  position: sticky; bottom: 0;
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  margin-top: 20px; padding: 14px 0;
+  background: var(--bg);
+  border-top: 1px solid var(--line);
+}
+.job { font-size: 0.9375rem; }
+.job.ok { color: var(--ok); }
+.job.bad { color: var(--bad); }
+.job.wait { color: var(--warn); }
+.printbar .who { width: 13em; margin-left: auto; }
+.printbar .who input { padding: 6px 10px; }
+.history { margin-top: 24px; }
+.history ul { list-style: none; margin: 0; padding: 0; }
+.job-row { display: grid; grid-template-columns: 5.5em minmax(0, 1fr) auto; gap: 12px; align-items: start; padding: 10px 0; border-top: 1px solid var(--line); }
+.job-row:first-child { border-top: none; }
+.job-when { white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 0.875rem; padding-top: 1px; }
+.job-what { min-width: 0; }
+.job-summary { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-meta { color: var(--muted); font-size: 0.8125rem; }
+.job-state { font-size: 0.875rem; }
+.job-state.ok { color: var(--ok); } .job-state.bad { color: var(--bad); } .job-state.wait { color: var(--warn); }
+.job-row button { padding: 4px 10px; font-size: 0.875rem; }
+.token { margin-bottom: 20px; }
+
+dialog {
+  width: min(720px, 94vw); max-height: 82vh; padding: 0;
+  border: 1px solid var(--line); border-radius: var(--radius-m);
+  background: var(--surface); color: var(--ink);
+}
+dialog::backdrop { background: rgba(15, 20, 18, 0.45); }
+.picker { display: flex; flex-direction: column; max-height: 82vh; }
+.picker-head { padding: 16px 16px 12px; border-bottom: 1px solid var(--line); display: grid; gap: 10px; }
+.picker-top { display: flex; gap: 8px; align-items: center; }
+.picker-body { overflow-y: auto; padding: 12px 16px 16px; }
+.pgrid { display: grid; gap: 6px; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); }
+.pgrid.emoji { grid-template-columns: repeat(auto-fill, minmax(52px, 1fr)); }
+.pick { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 8px 4px; border-color: transparent; min-width: 0; }
+.pick:hover { border-color: var(--line); background: var(--bg); }
+.pick .mdi { font-size: 30px; }
+.pick .emo { font-size: 28px; line-height: 1.1; }
+.pick-name { font-size: 0.6875rem; color: var(--muted); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picker-empty { color: var(--muted); padding: 24px 0; text-align: center; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Label printer</h1>
+    <div class="printer">
+      <span class="dot" id="dot"></span>
+      <span id="printer-text">Checking the printer…</span>
+      <button type="button" id="refresh">Check now</button>
+    </div>
+  </header>
+
+  <section class="token" id="token-box" hidden>
+    <div class="field">
+      <label for="token">Access token</label>
+      <div class="row">
+        <input type="password" id="token" autocomplete="current-password">
+        <button type="button" id="token-save">Save</button>
+      </div>
+      <div class="hint">This printer service requires the token from its configuration file.</div>
+    </div>
+  </section>
+
+  <div class="stage" aria-live="polite">
+    <div class="tape" id="tape"><img id="preview" alt="Label preview"></div>
+  </div>
+  <p class="stage-note" id="stage-note">Add some text to see the label.</p>
+  <p class="stage-hint" id="stage-hint" hidden></p>
+
+  <div class="columns">
+    <section aria-labelledby="elements-h">
+      <div class="section-head">
+        <h2 id="elements-h">Elements, left to right</h2>
+        <button type="button" class="linkish" id="new-label">New label</button>
+      </div>
+      <ul class="elements" id="elements"></ul>
+      <div class="add-bar" role="group" aria-label="Add element">
+        <span class="label">Add</span>
+        <button type="button" data-add="text"><span class="mdi" aria-hidden="true">&#xF0284;</span>Text</button>
+        <button type="button" data-add="icon"><span class="mdi" aria-hidden="true">&#xF0832;</span>Icon</button>
+        <button type="button" data-add="qr"><span class="mdi" aria-hidden="true">&#xF0432;</span>QR code</button>
+        <button type="button" data-add="barcode"><span class="mdi" aria-hidden="true">&#xF0071;</span>Barcode</button>
+        <button type="button" data-add="image"><span class="mdi" aria-hidden="true">&#xF0976;</span>Image</button>
+        <button type="button" data-add="space"><span class="mdi" aria-hidden="true">&#xF084E;</span>Space</button>
+      </div>
+    </section>
+
+    <div class="side">
+      <section aria-labelledby="layout-h" id="layout">
+        <div class="section-head"><h2 id="layout-h">Layout</h2></div>
+        <div class="field">
+          <label for="border">Border</label>
+          <select id="border">
+            <option value="none">None</option>
+            <option value="line">Line</option>
+            <option value="double">Double line</option>
+            <option value="rounded">Rounded</option>
+            <option value="dashed">Dashed</option>
+          </select>
+        </div>
+        <div class="grid2">
+          <div class="field">
+            <label for="margin">Ends (mm)</label>
+            <input type="number" id="margin" min="0" max="50" step="0.5" value="2">
+          </div>
+          <div class="field">
+            <label for="padding">Top and bottom (mm)</label>
+            <input type="number" id="padding" min="0" max="5" step="0.5" value="0">
+          </div>
+          <div class="field">
+            <label for="gap">Spacing (mm)</label>
+            <input type="number" id="gap" min="0" max="30" step="0.5" value="1.5">
+          </div>
+          <div class="field">
+            <label for="min-length">Min. length (mm)</label>
+            <input type="number" id="min-length" min="0" max="500" step="1" placeholder="Auto">
+          </div>
+        </div>
+        <div class="hint">Ends is the blank tape before and after the label, spacing the gap between elements. The printable area already keeps the edge the printer needs, so top and bottom adds extra space.</div>
+      </section>
+
+      <section aria-labelledby="settings-h" id="settings">
+        <div class="section-head"><h2 id="settings-h">Print settings</h2></div>
+        <div class="field">
+          <label for="tape-mm">Tape</label>
+          <select id="tape-mm">
+            <option value="">Inserted tape</option>
+            <option value="4">4 mm</option>
+            <option value="6">6 mm</option>
+            <option value="9">9 mm</option>
+            <option value="12">12 mm</option>
+            <option value="18">18 mm</option>
+          </select>
+          <div class="hint">Choosing a width stops printing if a different tape is inserted.</div>
+        </div>
+        <div class="field">
+          <label for="density">Darkness</label>
+          <div class="range-row">
+            <input type="range" id="density" min="-5" max="5" step="1" value="0">
+            <output id="density-out" for="density">0</output>
+          </div>
+        </div>
+        <div class="field">
+          <label for="copies">Copies</label>
+          <input type="number" id="copies" min="1" max="50" value="1">
+        </div>
+        <div class="field">
+          <label class="inline"><input type="checkbox" id="cut" checked> Cut after each label</label>
+        </div>
+        <div class="field">
+          <label class="inline"><input type="checkbox" id="rotate"> Turn label upside down</label>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <div class="printbar">
+    <button type="button" class="primary" id="print">Print label</button>
+    <span class="job" id="job" role="status"></span>
+    <button type="button" id="job-stop" hidden>Stop</button>
+    <button type="button" id="job-retry" hidden>Retry</button>
+    <div class="who">
+      <input type="text" id="who" placeholder="Your name (optional)" aria-label="Your name, shown in recent labels" maxlength="40">
+    </div>
+  </div>
+
+  <section class="history" aria-labelledby="history-h">
+    <div class="section-head"><h2 id="history-h">Recent labels</h2></div>
+    <ul id="jobs"></ul>
+  </section>
+
+  <dialog id="picker" aria-labelledby="picker-title">
+    <div class="picker">
+      <div class="picker-head">
+        <div class="picker-top">
+          <h2 id="picker-title" style="flex:1">Choose an icon</h2>
+          <button type="button" id="picker-close">Close</button>
+        </div>
+        <input type="text" id="picker-q" placeholder="Search in English, e.g. screw, cable, fridge" aria-label="Search">
+      </div>
+      <div class="picker-body">
+        <div class="pgrid" id="picker-grid" role="list"></div>
+        <p class="picker-empty" id="picker-empty" hidden></p>
+      </div>
+    </div>
+  </dialog>
+</main>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const glyph = (cp) => String.fromCodePoint(parseInt(cp, 16));
+  const STORE = "lwprint-design";
+  let token = "";
+  try { token = localStorage.getItem("lwprint-token") || ""; } catch (_) {}
+  let printerTape = null;
+  let els = [];
+  let nextId = 1;
+
+  /* ---------- API ---------- */
+  async function api(path, options = {}) {
+    const headers = Object.assign({}, options.headers || {});
+    if (token) headers["Authorization"] = "Bearer " + token;
+    const res = await fetch("api/" + path, Object.assign({}, options, { headers }));
+    if (res.status === 401) {
+      $("token-box").hidden = false;
+      throw new Error("Enter the access token to continue.");
+    }
+    return res;
+  }
+  async function errorText(res) {
+    try { return (await res.json()).error || res.statusText; } catch (_) { return res.statusText; }
+  }
+
+  /* ---------- Elements ---------- */
+  const KINDS = {
+    text:    { title: "Text",    icon: "F0284" },
+    icon:    { title: "Icon",    icon: "F0832" },
+    qr:      { title: "QR code", icon: "F0432" },
+    barcode: { title: "Barcode", icon: "F0071" },
+    image:   { title: "Image",   icon: "F0976" },
+    space:   { title: "Space",   icon: "F084E" },
+  };
+  function newEl(type) {
+    const base = { id: nextId++, type, valign: "center" };
+    const defaults = {
+      text: { text: "", align: "center", size: null },
+      icon: { name: null, codepoint: null, size: null },
+      qr: { data: "", size: null },
+      barcode: { data: "", symbology: "code128", height: null },
+      image: { data: null, dither: false, height: null },
+      space: { mm: 5 },
+    };
+    return Object.assign(base, defaults[type]);
+  }
+  const num = (v) => (v === "" || v === null || isNaN(Number(v)) ? null : Number(v));
+
+  function toElement(e) {
+    const extra = e.valign && e.valign !== "center" ? { valign: e.valign } : {};
+    switch (e.type) {
+      case "text":
+        if (!e.text.trim()) return null;
+        return Object.assign({ type: "text", text: e.text.replace(/\s+$/, ""), align: e.align },
+          e.size ? { size_mm: e.size } : {}, extra);
+      case "icon":
+        if (!e.name) return null;
+        return Object.assign({ type: "icon", name: e.name }, e.size ? { size_mm: e.size } : {}, extra);
+      case "qr":
+        if (!e.data.trim()) return null;
+        return Object.assign({ type: "qr", data: e.data.trim() }, e.size ? { size_mm: e.size } : {}, extra);
+      case "barcode":
+        if (!e.data.trim()) return null;
+        return Object.assign({ type: "barcode", data: e.data.trim(), symbology: e.symbology, module_px: 2 },
+          e.height ? { height_mm: e.height } : {}, extra);
+      case "image":
+        if (!e.data) return null;
+        return Object.assign({ type: "image", path: e.data, dither: e.dither },
+          e.height ? { height_mm: e.height } : {}, extra);
+      case "space":
+        return { type: "space", mm: Math.max(0, e.mm || 0) };
+    }
+    return null;
+  }
+
+  function buildRequest() {
+    const elements = els.map(toElement).filter(Boolean);
+    const req = {
+      elements,
+      margin_mm: num($("margin").value) ?? 0,
+      padding_mm: num($("padding").value) ?? 0,
+      gap_mm: num($("gap").value) ?? 0,
+      border: $("border").value,
+      density: Number($("density").value),
+      copies: Math.max(1, Math.min(50, Number($("copies").value) || 1)),
+      cut: $("cut").checked,
+      rotate: $("rotate").checked,
+    };
+    const minLen = num($("min-length").value);
+    if (minLen) req.min_length_mm = minLen;
+    const who = $("who").value.trim();
+    if (who) req.requested_by = who;
+    if ($("tape-mm").value) req.tape_mm = Number($("tape-mm").value);
+    return req;
+  }
+
+  /* DOM helpers */
+  function h(tag, attrs = {}, ...children) {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === "class") n.className = v;
+      else if (k === "text") n.textContent = v;
+      else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+      else if (v === true) n.setAttribute(k, "");
+      else if (v !== false && v != null) n.setAttribute(k, v);
+    }
+    for (const c of children) if (c) n.append(c);
+    return n;
+  }
+  function field(label, input) {
+    return h("div", { class: "field" }, h("label", { for: input.id, text: label }), input);
+  }
+  function select(id, value, options, onChange) {
+    const s = h("select", { id, onchange: (e) => onChange(e.target.value) });
+    for (const [v, t] of options) s.append(h("option", { value: v, text: t, selected: v === value }));
+    return s;
+  }
+  function mmInput(id, value, placeholder, onChange, max = 18) {
+    return h("input", { type: "number", id, min: "0.5", max: String(max), step: "0.5", value: value ?? "", placeholder,
+      oninput: (e) => onChange(num(e.target.value)) });
+  }
+  const VALIGN = [["center", "Middle"], ["top", "Top"], ["bottom", "Bottom"]];
+
+  function body(e) {
+    const p = `el${e.id}-`;
+    const changed = () => { schedulePreview(); save(); };
+    const set = (k) => (v) => { e[k] = v; changed(); };
+    const valign = field("Position", select(p + "valign", e.valign, VALIGN, set("valign")));
+    switch (e.type) {
+      case "text": {
+        const ta = h("textarea", { id: p + "text", rows: "2", placeholder: "Screws M4\nBox 12",
+          oninput: (ev) => { e.text = ev.target.value; changed(); } });
+        ta.value = e.text;
+        const emoji = h("button", { type: "button", class: "linkish", text: "Insert emoji",
+          onclick: () => openPicker("emoji", (hit) => insertAt(ta, e, hit.emoji)) });
+        return [
+          h("div", { class: "field" },
+            h("label", { for: ta.id, text: "Text" }), ta,
+            h("div", { class: "hint", style: "display:flex;justify-content:space-between;gap:8px" },
+              h("span", { text: "Each line becomes a line on the label." }), emoji)),
+          h("div", { class: "grid3" },
+            field("Alignment", select(p + "align", e.align, [["left", "Left"], ["center", "Centre"], ["right", "Right"]], set("align"))),
+            field("Line height (mm)", mmInput(p + "size", e.size, "Auto", set("size"))),
+            valign),
+        ];
+      }
+      case "icon": {
+        const chip = h("div", { class: "icon-pick" },
+          h("span", { class: "mdi", "aria-hidden": "true", text: e.codepoint ? glyph(e.codepoint) : "" }),
+          h("span", { text: e.name || "No icon chosen" }),
+          h("button", { type: "button", text: e.name ? "Change" : "Choose",
+            onclick: () => openPicker("icons", (hit) => { e.name = hit.name; e.codepoint = hit.codepoint; renderList(); changed(); }) }));
+        return [chip, h("div", { class: "grid2" }, field("Size (mm)", mmInput(p + "size", e.size, "Full height", set("size"))), valign)];
+      }
+      case "qr": {
+        const inp = h("input", { type: "text", id: p + "data", value: e.data, placeholder: "https://…",
+          oninput: (ev) => { e.data = ev.target.value; changed(); } });
+        return [field("Content", inp), h("div", { class: "grid2" }, field("Size (mm)", mmInput(p + "size", e.size, "Full height", set("size"))), valign)];
+      }
+      case "barcode": {
+        const inp = h("input", { type: "text", id: p + "data", value: e.data,
+          oninput: (ev) => { e.data = ev.target.value; changed(); } });
+        return [
+          field("Content", inp),
+          h("div", { class: "grid3" },
+            field("Type", select(p + "sym", e.symbology, [["code128", "Code 128"], ["ean13", "EAN-13"], ["code39", "Code 39"]], set("symbology"))),
+            field("Height (mm)", mmInput(p + "height", e.height, "Full", set("height"))),
+            valign),
+        ];
+      }
+      case "image": {
+        const file = h("input", { type: "file", id: p + "file", accept: "image/png,image/jpeg",
+          onchange: (ev) => {
+            const f = ev.target.files[0];
+            if (!f) return;
+            const r = new FileReader();
+            r.onload = () => { e.data = r.result; renderList(); changed(); };
+            r.readAsDataURL(f);
+          } });
+        return [
+          h("div", { class: "field" },
+            h("label", { for: file.id, text: "Picture" }),
+            h("div", { class: "icon-pick" }, e.data ? h("img", { class: "thumb", src: e.data, alt: "" }) : null, file)),
+          h("div", { class: "grid3" },
+            field("Height (mm)", mmInput(p + "height", e.height, "Full", set("height"))),
+            valign,
+            h("div", { class: "field", style: "align-self:end" },
+              h("label", { class: "inline" },
+                h("input", { type: "checkbox", id: p + "dither", checked: e.dither, onchange: (ev) => set("dither")(ev.target.checked) }),
+                "Dither"))),
+        ];
+      }
+      case "space":
+        return [field("Width (mm)", mmInput(p + "mm", e.mm, "5", set("mm"), 200))];
+    }
+    return [];
+  }
+
+  function renderList() {
+    const list = $("elements");
+    list.replaceChildren();
+    els.forEach((e, i) => {
+      const kind = KINDS[e.type];
+      const move = (d) => { const j = i + d; [els[i], els[j]] = [els[j], els[i]]; renderList(); schedulePreview(); save(); };
+      const head = h("div", { class: "el-head" },
+        h("span", { class: "mdi kind", "aria-hidden": "true", text: glyph(kind.icon) }),
+        h("span", { class: "el-title", text: kind.title }),
+        h("span", { class: "el-actions" },
+          h("button", { type: "button", class: "icon-btn", "aria-label": `Move ${kind.title.toLowerCase()} left`, title: "Move left",
+            disabled: i === 0, onclick: () => move(-1) }, h("span", { class: "mdi", "aria-hidden": "true", text: glyph("F004D") })),
+          h("button", { type: "button", class: "icon-btn", "aria-label": `Move ${kind.title.toLowerCase()} right`, title: "Move right",
+            disabled: i === els.length - 1, onclick: () => move(1) }, h("span", { class: "mdi", "aria-hidden": "true", text: glyph("F0054") })),
+          h("button", { type: "button", class: "icon-btn", "aria-label": `Remove ${kind.title.toLowerCase()}`, title: "Remove",
+            onclick: () => { els.splice(i, 1); renderList(); schedulePreview(); save(); } },
+            h("span", { class: "mdi", "aria-hidden": "true", text: glyph("F09E7") }))));
+      list.append(h("li", { class: "el" }, head, h("div", { class: "el-body" }, ...body(e))));
+    });
+    if (!els.length) list.append(h("li", { class: "hint", text: "The label is empty. Add an element below." }));
+  }
+
+  function addElement(type) {
+    const e = newEl(type);
+    els.push(e);
+    renderList();
+    if (type === "icon") {
+      openPicker("icons", (hit) => { e.name = hit.name; e.codepoint = hit.codepoint; renderList(); schedulePreview(); save(); },
+        () => { if (!e.name) { els = els.filter((x) => x !== e); renderList(); } });
+    } else {
+      const first = $("elements").lastElementChild.querySelector("textarea, input[type=text], input[type=file]");
+      if (first && type !== "image") first.focus();
+    }
+    schedulePreview();
+    save();
+  }
+
+  function insertAt(ta, e, text) {
+    const a = ta.selectionStart ?? ta.value.length, b = ta.selectionEnd ?? ta.value.length;
+    ta.value = ta.value.slice(0, a) + text + ta.value.slice(b);
+    e.text = ta.value;
+    ta.focus();
+    ta.setSelectionRange(a + text.length, a + text.length);
+    schedulePreview(); save();
+  }
+
+  /* ---------- Saving the design in this browser ---------- */
+  const SETTINGS = ["border", "margin", "padding", "gap", "min-length", "tape-mm", "density", "copies", "cut", "rotate"];
+  function save() {
+    const settings = {};
+    for (const id of SETTINGS) settings[id] = $(id).type === "checkbox" ? $(id).checked : $(id).value;
+    try { localStorage.setItem(STORE, JSON.stringify({ els, settings })); } catch (_) {}
+  }
+  function load() {
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(STORE) || "null"); } catch (_) {}
+    if (saved && Array.isArray(saved.els)) {
+      els = saved.els.filter((e) => KINDS[e.type]);
+      nextId = els.reduce((m, e) => Math.max(m, e.id || 0), 0) + 1;
+      for (const [id, v] of Object.entries(saved.settings || {})) {
+        if (!$(id)) continue;
+        if ($(id).type === "checkbox") $(id).checked = !!v; else $(id).value = v;
+      }
+      $("density-out").textContent = $("density").value;
+    }
+    if (!els.length) els = [newEl("text")];
+  }
+
+  /* ---------- Preview ---------- */
+  let previewTimer = null, previewSeq = 0, previewUrl = null;
+  function schedulePreview() { clearTimeout(previewTimer); previewTimer = setTimeout(updatePreview, 250); }
+  async function updatePreview() {
+    const req = buildRequest();
+    const note = $("stage-note");
+    if (!req.elements.some((e) => e.type !== "space")) {
+      $("preview").removeAttribute("src");
+      $("tape").style.padding = "";
+      $("stage-hint").hidden = true;
+      note.className = "stage-note";
+      note.textContent = "Add some text to see the label.";
+      $("print").disabled = true;
+      return;
+    }
+    const seq = ++previewSeq;
+    $("tape").classList.add("loading");
+    try {
+      const res = await api("preview", { method: "POST", body: JSON.stringify(req) });
+      if (seq !== previewSeq) return;
+      if (!res.ok) throw new Error(await errorText(res));
+      const tapeMm = Number(res.headers.get("x-tape-mm"));
+      const hint = res.headers.get("x-label-notes");
+      $("stage-hint").hidden = !hint;
+      $("stage-hint").textContent = hint || "";
+      const lengthMm = res.headers.get("x-label-length-mm");
+      const blob = await res.blob();
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      previewUrl = URL.createObjectURL(blob);
+      const img = $("preview");
+      img.onload = () => {
+        const ih = img.naturalHeight;
+        const scale = Math.max(1, Math.round(130 / ih));
+        img.style.width = img.naturalWidth * scale + "px";
+        img.style.height = ih * scale + "px";
+        // Show the unprintable edges of the physical tape (180 dots per inch).
+        const edge = Math.max(0, (tapeMm * 180 / 25.4 - ih) / 2) * scale;
+        $("tape").style.padding = edge + "px 0";
+      };
+      img.src = previewUrl;
+      note.className = "stage-note";
+      note.textContent = `${Math.round(lengthMm)} mm long on ${tapeMm} mm tape` +
+        (!req.tape_mm && !printerTape ? " (no tape detected, showing 12 mm)" : "");
+      $("print").disabled = false;
+    } catch (e) {
+      if (seq !== previewSeq) return;
+      $("stage-hint").hidden = true;
+      note.className = "stage-note error";
+      note.textContent = e.message;
+      $("print").disabled = true;
+    } finally {
+      if (seq === previewSeq) $("tape").classList.remove("loading");
+    }
+  }
+
+  /* ---------- Printer status and jobs ---------- */
+  function showStatus(st) {
+    printerTape = st.tape_mm;
+    const dot = $("dot");
+    let text;
+    if (st.state === "unknown") { dot.className = "dot"; text = "Checking the printer…"; }
+    else if (!st.printer_online) { dot.className = "dot bad"; text = "Printer is off or out of range"; }
+    else if (st.problem) { dot.className = "dot warn"; text = st.problem.charAt(0).toUpperCase() + st.problem.slice(1); }
+    else { dot.className = "dot ok"; text = `Ready, ${st.tape_mm} mm tape`; }
+    if (st.queue > 0) text += `, ${st.queue} waiting`;
+    $("printer-text").textContent = text;
+  }
+  async function loadStatus() {
+    try { const res = await api("status"); if (res.ok) showStatus(await res.json()); } catch (_) {}
+  }
+  const jobWords = { queued: "Queued", waiting: "Waiting for the printer", printing: "Printing", done: "Printed", failed: "Failed", cancelled: "Stopped" };
+  const stateClass = (st) => (st === "done" ? "ok" : st === "failed" ? "bad" : st === "waiting" ? "wait" : "");
+  function describeJob(job) {
+    if (job.state === "waiting" && job.message) return job.message.replace(/^waiting: /, "Waiting: ");
+    if (job.state === "printing") {
+      const progress = job.copies > 1 ? ` label ${Math.min(job.copies_done + 1, job.copies)} of ${job.copies}` : "";
+      return job.stopping ? `Printing${progress}, stopping after this label` : `Printing${progress}…`;
+    }
+    const word = jobWords[job.state] || job.state;
+    return job.message ? `${word}: ${job.message}` : word;
+  }
+  async function jobAction(id, action) {
+    const res = await api(`jobs/${id}/${action}`, { method: "POST" });
+    if (!res.ok) throw new Error(await errorText(res));
+    return res.json();
+  }
+  async function loadJobs() {
+    try {
+      const res = await api("jobs");
+      if (!res.ok) return;
+      const list = $("jobs");
+      list.replaceChildren();
+      const jobs = (await res.json()).slice(0, 12);
+      for (const job of jobs) {
+        const time = new Date(job.created * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        const who = job.requested_by || job.source;
+        const copies = job.copies === 1 ? "1 copy" : `${job.copies} copies`;
+        const meta = [who, copies, job.retry_of ? `retry of #${job.retry_of}` : null].filter(Boolean).join(", ");
+        const active = ["queued", "waiting", "printing"].includes(job.state);
+        let action = null;
+        if (active && !job.stopping) {
+          action = h("button", { type: "button", text: "Stop", onclick: async () => { try { await jobAction(job.id, "cancel"); } catch (_) {} loadJobs(); } });
+        } else if (!active) {
+          action = h("button", { type: "button", text: job.state === "done" ? "Print again" : "Retry",
+            onclick: async () => {
+              try { const j = await jobAction(job.id, "retry"); followJob(j.id); } catch (e) { $("job").className = "job bad"; $("job").textContent = e.message; }
+            } });
+        }
+        list.append(h("li", { class: "job-row" },
+          h("span", { class: "job-when", text: time }),
+          h("div", { class: "job-what" },
+            h("div", { class: "job-summary", text: job.summary || `Label #${job.id}` }),
+            h("div", { class: "job-meta", text: meta }),
+            h("div", { class: "job-state " + stateClass(job.state), text: describeJob(job) })),
+          action));
+      }
+      if (!jobs.length) list.append(h("li", { class: "hint", text: "Nothing printed yet." }));
+    } catch (_) {}
+  }
+  let followed = null;
+  async function followJob(id) {
+    followed = id;
+    const out = $("job");
+    $("print").disabled = true;
+    $("job-retry").hidden = true;
+    out.className = "job"; out.textContent = "Queued";
+    for (;;) {
+      let job;
+      try {
+        const res = await api("jobs/" + id);
+        if (!res.ok) throw new Error(await errorText(res));
+        job = await res.json();
+      } catch (e) { out.className = "job bad"; out.textContent = e.message; break; }
+      if (followed !== id) return;
+      out.textContent = describeJob(job);
+      out.className = "job " + stateClass(job.state);
+      const active = ["queued", "waiting", "printing"].includes(job.state);
+      $("job-stop").hidden = !active || job.stopping;
+      if (!active) {
+        $("job-retry").hidden = job.state === "done";
+        $("job-retry").dataset.id = id;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    $("job-stop").hidden = true;
+    $("print").disabled = false;
+    loadStatus(); loadJobs();
+  }
+  $("job-stop").addEventListener("click", async () => {
+    if (followed == null) return;
+    $("job-stop").hidden = true;
+    try { await jobAction(followed, "cancel"); } catch (e) { $("job").textContent = e.message; }
+  });
+  $("job-retry").addEventListener("click", async () => {
+    try { const j = await jobAction($("job-retry").dataset.id, "retry"); followJob(j.id); }
+    catch (e) { $("job").className = "job bad"; $("job").textContent = e.message; }
+  });
+
+  /* ---------- Icon and emoji picker ---------- */
+  let pickerMode = "icons", pickHandler = null, cancelHandler = null, picked = false, searchTimer = null, searchSeq = 0;
+  function openPicker(mode, onPick, onCancel) {
+    pickerMode = mode; pickHandler = onPick; cancelHandler = onCancel || null; picked = false;
+    $("picker-title").textContent = mode === "icons" ? "Choose an icon" : "Insert an emoji";
+    $("picker-grid").className = mode === "icons" ? "pgrid" : "pgrid emoji";
+    $("picker-q").value = "";
+    $("picker").showModal();
+    $("picker-q").focus();
+    runSearch();
+  }
+  async function runSearch() {
+    const seq = ++searchSeq;
+    const q = $("picker-q").value.trim();
+    const grid = $("picker-grid"), empty = $("picker-empty");
+    let hits = [];
+    try {
+      const res = await api(`${pickerMode}?q=${encodeURIComponent(q)}`);
+      if (!res.ok) throw new Error(await errorText(res));
+      hits = await res.json();
+    } catch (e) {
+      if (seq !== searchSeq) return;
+      grid.replaceChildren(); empty.hidden = false; empty.textContent = e.message; return;
+    }
+    if (seq !== searchSeq) return;
+    grid.replaceChildren();
+    for (const hit of hits) {
+      const choose = () => { picked = true; $("picker").close(); pickHandler && pickHandler(hit); };
+      grid.append(pickerMode === "icons"
+        ? h("button", { type: "button", class: "pick", role: "listitem", title: hit.name, onclick: choose },
+            h("span", { class: "mdi", "aria-hidden": "true", text: glyph(hit.codepoint) }),
+            h("span", { class: "pick-name", text: hit.name }))
+        : h("button", { type: "button", class: "pick", role: "listitem", title: hit.name, "aria-label": hit.name, onclick: choose },
+            h("span", { class: "emo", text: hit.emoji })));
+    }
+    empty.hidden = hits.length > 0;
+    if (!hits.length) empty.textContent = `Nothing found for “${q}”. Try another English word.`;
+  }
+  $("picker").addEventListener("close", () => { if (!picked && cancelHandler) cancelHandler(); });
+  $("picker-close").addEventListener("click", () => $("picker").close());
+  $("picker-q").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(runSearch, 150); });
+
+  /* ---------- Wiring ---------- */
+  document.querySelectorAll("[data-add]").forEach((b) => b.addEventListener("click", () => addElement(b.dataset.add)));
+  for (const id of SETTINGS) {
+    $(id).addEventListener("input", () => { schedulePreview(); save(); });
+    $(id).addEventListener("change", () => { schedulePreview(); save(); });
+  }
+  $("density").addEventListener("input", () => { $("density-out").textContent = $("density").value; });
+  $("new-label").addEventListener("click", () => {
+    els = [newEl("text")];
+    renderList(); schedulePreview(); save();
+    $("elements").querySelector("textarea").focus();
+  });
+  $("print").addEventListener("click", async () => {
+    const out = $("job");
+    $("print").disabled = true;
+    out.className = "job"; out.textContent = "Sending…";
+    try {
+      const res = await api("print", { method: "POST", body: JSON.stringify(buildRequest()) });
+      if (!res.ok) throw new Error(await errorText(res));
+      const job = await res.json();
+      followJob(job.id);
+      loadJobs();
+    } catch (e) {
+      out.className = "job bad"; out.textContent = e.message;
+      $("print").disabled = false;
+    }
+  });
+  $("refresh").addEventListener("click", async () => {
+    $("printer-text").textContent = "Checking the printer…";
+    try { await api("status/refresh", { method: "POST" }); } catch (_) {}
+    setTimeout(loadStatus, 4000);
+    setTimeout(loadStatus, 12000);
+  });
+  $("token-save").addEventListener("click", () => {
+    token = $("token").value.trim();
+    try { localStorage.setItem("lwprint-token", token); } catch (_) {}
+    $("token-box").hidden = true;
+    loadStatus(); loadJobs(); schedulePreview();
+  });
+
+  try { $("who").value = localStorage.getItem("lwprint-name") || ""; } catch (_) {}
+  $("who").addEventListener("change", () => { try { localStorage.setItem("lwprint-name", $("who").value.trim()); } catch (_) {} });
+
+  load();
+  renderList();
+  $("print").disabled = true;
+  schedulePreview();
+  loadStatus();
+  loadJobs();
+  setInterval(() => { loadStatus(); loadJobs(); }, 10000);
+})();
+</script>
+</body>
+</html>

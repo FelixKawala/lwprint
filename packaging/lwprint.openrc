@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+# OpenRC service for lwprint. Install as /etc/init.d/lwprint, then:
+#   rc-update add lwprint && rc-service lwprint start
+
+name="lwprint"
+description="Label printing service for Epson LabelWorks printers"
+command="/usr/local/bin/lwprint"
+command_args="serve --config /etc/lwprint.toml"
+output_log="/var/log/lwprint.log"
+error_log="/var/log/lwprint.log"
+respawn_delay=5
+supervisor=supervise-daemon
+
+depend() {
+	need net bluetooth
+	after dbus
+}

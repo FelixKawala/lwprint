@@ -1,0 +1,292 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "lwprint-label",
+  "title": "lwprint label",
+  "description": "A label for lwprint. Used by `lwprint print --spec`, POST /api/print, POST /api/preview and the MQTT print topic. Elements are placed left to right and centred across the tape.",
+  "type": "object",
+  "required": [
+    "elements"
+  ],
+  "properties": {
+    "elements": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/element"
+      }
+    },
+    "margin_mm": {
+      "type": "number",
+      "minimum": 0,
+      "default": 2,
+      "description": "Blank tape before and after the content."
+    },
+    "gap_mm": {
+      "type": "number",
+      "minimum": 0,
+      "default": 1.5,
+      "description": "Space between elements."
+    },
+    "min_length_mm": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Minimum label length; content is centred."
+    },
+    "copies": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 50,
+      "default": 1,
+      "description": "Service only."
+    },
+    "density": {
+      "type": "integer",
+      "minimum": -5,
+      "maximum": 5,
+      "default": 0,
+      "description": "Service only. Print darkness."
+    },
+    "cut": {
+      "type": "boolean",
+      "default": true,
+      "description": "Service only. Cut after each label."
+    },
+    "rotate": {
+      "type": "boolean",
+      "default": false,
+      "description": "Service only. Turn the label 180 degrees."
+    },
+    "tape_mm": {
+      "enum": [
+        4,
+        6,
+        9,
+        12,
+        18
+      ],
+      "description": "Service only. Printing fails if a different tape is inserted; previews render for this width."
+    },
+    "request_id": {
+      "type": "string",
+      "description": "Service only. Echoed back in job results."
+    },
+    "padding_mm": {
+      "type": "number",
+      "minimum": 0,
+      "default": 0,
+      "description": "Extra blank space at the top and bottom edge."
+    },
+    "border": {
+      "enum": [
+        "none",
+        "line",
+        "double",
+        "rounded",
+        "dashed"
+      ],
+      "default": "none",
+      "description": "Frame around the content."
+    },
+    "requested_by": {
+      "type": "string",
+      "maxLength": 40,
+      "description": "Service only. Name shown in the job history (not verified)."
+    }
+  },
+  "$defs": {
+    "element": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "text"
+          ],
+          "properties": {
+            "type": {
+              "const": "text"
+            },
+            "text": {
+              "type": "string",
+              "description": "Use \\n for more lines. Emoji are printed with the bundled monochrome emoji font."
+            },
+            "size_mm": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Line height; by default lines share the tape height."
+            },
+            "valign": {
+              "enum": [
+                "top",
+                "center",
+                "bottom"
+              ],
+              "default": "center",
+              "description": "Vertical position when the element is smaller than the tape height."
+            },
+            "align": {
+              "enum": [
+                "left",
+                "center",
+                "right"
+              ],
+              "default": "center"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "data"
+          ],
+          "properties": {
+            "type": {
+              "const": "qr"
+            },
+            "data": {
+              "type": "string"
+            },
+            "valign": {
+              "enum": [
+                "top",
+                "center",
+                "bottom"
+              ],
+              "default": "center",
+              "description": "Vertical position when the element is smaller than the tape height."
+            },
+            "size_mm": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "QR code size; as large as fits by default."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "name"
+          ],
+          "properties": {
+            "type": {
+              "const": "icon"
+            },
+            "name": {
+              "type": "string",
+              "description": "Material Design Icons name, e.g. \"screwdriver\" or \"mdi:screwdriver\". Find names with `lwprint icons <search>`."
+            },
+            "size_mm": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Icon height; fills the tape by default."
+            },
+            "valign": {
+              "enum": [
+                "top",
+                "center",
+                "bottom"
+              ],
+              "default": "center",
+              "description": "Vertical position when the element is smaller than the tape height."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "data"
+          ],
+          "properties": {
+            "type": {
+              "const": "barcode"
+            },
+            "data": {
+              "type": "string"
+            },
+            "symbology": {
+              "enum": [
+                "code128",
+                "ean13",
+                "code39"
+              ],
+              "default": "code128"
+            },
+            "module_px": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 2,
+              "description": "Narrowest bar width in pixels (1 px = 0.14 mm)."
+            },
+            "valign": {
+              "enum": [
+                "top",
+                "center",
+                "bottom"
+              ],
+              "default": "center",
+              "description": "Vertical position when the element is smaller than the tape height."
+            },
+            "height_mm": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Height; full height by default."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "path"
+          ],
+          "properties": {
+            "type": {
+              "const": "image"
+            },
+            "path": {
+              "type": "string",
+              "description": "File path (CLI only) or data: URL (CLI and service)."
+            },
+            "dither": {
+              "type": "boolean",
+              "default": false
+            },
+            "valign": {
+              "enum": [
+                "top",
+                "center",
+                "bottom"
+              ],
+              "default": "center",
+              "description": "Vertical position when the element is smaller than the tape height."
+            },
+            "height_mm": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "description": "Height; full height by default."
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": [
+            "type",
+            "mm"
+          ],
+          "properties": {
+            "type": {
+              "const": "space"
+            },
+            "mm": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        }
+      ]
+    }
+  }
+}
